@@ -225,6 +225,12 @@ struct llama_hparams {
     // output embedding dimension (0 = use n_embd)
     uint32_t n_embd_out_impl = 0;
 
+    uint32_t dflash_block_size       = 0;
+    uint32_t dflash_conv_kernel_size = 0;
+    uint32_t dflash_conv_group_size  = 0;
+    uint32_t dflash_selector_rank    = 0;
+    uint32_t dflash_selector_top_k   = 0;
+
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
     uint32_t n_no_rope_layer_step    = 4;
@@ -265,6 +271,24 @@ struct llama_hparams {
     // DeepSeek-V4
     uint32_t dsv4_o_group_count        = 0;
     uint32_t dsv4_o_lora_rank          = 0;
+    // Motif-3
+    uint32_t motif_n_noise_heads    = 0;
+    float    motif_mscale           = 1.0f;
+    float    motif_poly_eps         = 1e-6f;
+    float    motif_poly_out_scale   = 1.0f;
+    float    motif_poly_bias_clamp  = 0.0f;
+    float    motif_poly_hidden_clamp = 0.0f;
+    bool     motif_poly_sigmoid_w   = true;
+    uint32_t motif_mhc_mult         = 0;
+    uint32_t motif_mhc_iters        = 20;
+    float    motif_mhc_post_coeff   = 1.0f;
+
+    // Motif-3 GDLA, MLA latent KV cache on the full-attention layers.
+    bool     motif_mla_kv        = false;
+    uint32_t motif_n_embd_head_k = 0; // true per-head K dim (qk_nope + qk_rope)
+    uint32_t motif_n_embd_head_v = 0; // true per-head V dim
+    uint32_t motif_n_head_kv     = 0; // true GQA KV head count of the GDLA projections
+
     uint32_t dsv4_hc_mult              = 0;
     uint32_t dsv4_hc_sinkhorn_iters    = 0;
     uint32_t dsv4_hash_layer_count     = 0;

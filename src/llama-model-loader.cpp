@@ -1262,6 +1262,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
             t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
             GGML_ASSERT(t_meta.ne[dim] >= 1);
+            // nb[1] spans a row: ne[0]/blck_size blocks, not ne[0] elements
             if (dim == 0) {
                 t_meta.nb[dim] = ggml_type_size(type);
             } else if (dim == 1) {
@@ -1291,6 +1292,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (flags & TENSOR_ALLOW_RESHAPE) {
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
             t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            // nb[1] spans a row: ne[0]/blck_size blocks, not ne[0] elements
             if (dim == 0) {
                 t_meta.nb[dim] = ggml_type_size(t_meta.type);
             } else if (dim == 1) {

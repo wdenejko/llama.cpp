@@ -91,6 +91,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_mellum(params);
         case LLM_ARCH_NANBEIGE:
             return new llama_model_nanbeige(params);
+        case LLM_ARCH_MOTIF3:
+            return new llama_model_motif3(params);
         case LLM_ARCH_QWEN:
             return new llama_model_qwen(params);
         case LLM_ARCH_QWEN2:
@@ -944,6 +946,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_288B_A19B:     return "288B.A19B";
         case LLM_TYPE_300B_A47B:     return "300B.A47B";
         case LLM_TYPE_310B_A15B:     return "310B.A15B";
+        case LLM_TYPE_314B_A13B:     return "314B.A13B";
         case LLM_TYPE_355B_A32B:     return "355B.A32B";
         case LLM_TYPE_397B_A17B:     return "397B.A17B";
         case LLM_TYPE_685B_A37B:     return "685B.A37B";
@@ -2621,6 +2624,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     // add backend sampling layers (if any)
     llm->build_sampling();
+    llm->build_post_sampling();
 
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers
@@ -2853,6 +2857,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA:
         case LLM_ARCH_GEMMA2:
         case LLM_ARCH_GEMMA3:
+        case LLM_ARCH_MOTIF3:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA4_ASSISTANT:
@@ -3136,6 +3141,14 @@ const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
 
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
+}
+
+int32_t llama_model_dflash2_top_k(const struct llama_model * model) {
+    // must match build_arch_graph: the DSV4 decode graph does not build the selector lattice
+    if (model->dflash_selector_hidden == nullptr || model->hparams.dsv4_hc_mult > 0) {
+        return 0;
+    }
+    return (int32_t) model->hparams.dflash_selector_top_k;
 }
 
 uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {

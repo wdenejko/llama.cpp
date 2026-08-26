@@ -244,8 +244,14 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const uint n = iqs / 32;                   // 0,1,2,3
             const uint b = (iqs % 32) / 16;            // 0,1
-            const uint is = 2 * n + b;                 // 0..7
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
+
+#ifdef MMID_QK_SCACHE
+            // (d, m) precomputed per (tile row, sub-block) at superblock boundaries
+            const float d = scache_dm[col * 8 + 2 * n + b].x;
+            const float m = scache_dm[col * 8 + 2 * n + b].y;
+#else
+            const uint is = 2 * n + b;                 // 0..7
 
             const vec2 loadd = vec2(data_a[ib].dm);
 
@@ -266,6 +272,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const float d = loadd.x * sc;
             const float m = -loadd.y * mbyte;
+#endif
 
             const vec4 q = vec4(unpack8((data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F));
 
@@ -280,9 +287,15 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const uint n = iqs / 32;                   // 0,1,2,3
             const uint b = (iqs % 32) / 16;            // 0,1
-            const uint is = 2 * n + b;                 // 0..7
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
             const uint qhi = (iqs % 16) * 2;           // 0,2,4..30
+
+#ifdef MMID_QK_SCACHE
+            // (d, m) precomputed per (tile row, sub-block) at superblock boundaries
+            const float d = scache_dm[col * 8 + 2 * n + b].x;
+            const float m = scache_dm[col * 8 + 2 * n + b].y;
+#else
+            const uint is = 2 * n + b;                 // 0..7
 
             const vec2 loadd = vec2(data_a[ib].dm);
 
@@ -303,6 +316,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const float d = loadd.x * sc;
             const float m = -loadd.y * mbyte;
+#endif
 
             const uint qs = (data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F;
             const uint qh = ((data_a_packed32[ib].qh[qhi / 4] >> (iqs / 16)) & 0x01010101) << 4;

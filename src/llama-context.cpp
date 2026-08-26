@@ -2302,6 +2302,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
+        model.arch == LLM_ARCH_MOTIF3 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_01 ||
@@ -2312,6 +2313,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
+    }
+
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        const uint32_t selector_tokens = std::min<uint32_t>(
+                n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
+        res += 32*selector_tokens;
     }
 
     uint32_t n_sampling_nodes = 0;
