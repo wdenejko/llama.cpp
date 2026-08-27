@@ -234,6 +234,14 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
     }
+    // A draft-only MTP file carries just the nextn block, so the trunk hc weights are
+    // absent (mtp_only at load time). Building the trunk graph would dereference them and
+    // crash; fail clearly instead. The draft path (LLM_GRAPH_TYPE_DECODER_MTP) above is fine.
+    if (hparams.n_layer_nextn > 0 && !layers.empty() && layers[0].hc_attn_norm == nullptr) {
+        throw std::runtime_error(
+            "qwen4exp: draft-only MTP head has no trunk layers; load it as a draft "
+            "(-md / --model-draft) alongside a base model, not as the main model (-m)");
+    }
     return std::make_unique<graph>(*this, params);
 }
 
