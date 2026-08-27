@@ -1089,6 +1089,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
+    vk_pipeline pipeline_q4x_hc_combine_f32;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1930,6 +1931,15 @@ struct vk_op_dsv4_hc_post_push_constants {
     uint32_t sd0, sd1, sd2;
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
+
+struct vk_op_q4x_hc_combine_push_constants {
+    uint32_t n_embd, hc, nr;
+    uint32_t sr0, sr1, sr2;
+    uint32_t sb0, sb1;
+    uint32_t si0, si1;
+    uint32_t sd0, sd1, sd2;
+};
+static_assert(sizeof(vk_op_q4x_hc_combine_push_constants) <= 128);
 
 struct vk_op_flash_attn_union_push_constants {
     uint32_t n_kv, n_kv_raw, n_batch, n_top_k, max_union, nbt1, max_words, pad_to, count_only;
@@ -6529,6 +6539,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,
         "dsv4_hc_post_f32", dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5,
         sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_q4x_hc_combine_f32,
+        "q4x_hc_combine_f32", q4x_hc_combine_f32_len, q4x_hc_combine_f32_data, "main", 4,
+        sizeof(vk_op_q4x_hc_combine_push_constants), {256, 1, 1}, {}, 1);
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size}, 1, true, true);
@@ -14603,6 +14617,33 @@ static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subc
         pc, {nr, 1, 1});
 }
 
+static void ggml_vk_q4x_hc_combine(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * residual  = dst->src[0];
+    const ggml_tensor * block_out = dst->src[1];
+    const ggml_tensor * inject    = dst->src[2];
+
+    const uint32_t n_embd   = (uint32_t) residual->ne[0];
+    const uint32_t hc       = (uint32_t) residual->ne[1];
+    const uint32_t n_tokens = (uint32_t) residual->ne[2];
+    const uint32_t nr       = n_embd * hc * n_tokens;
+
+    vk_pipeline pipeline = ctx->device->pipeline_q4x_hc_combine_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_q4x_hc_combine_push_constants pc = {
+        n_embd, hc, nr,
+        (uint32_t)(residual->nb[0]  / sizeof(float)), (uint32_t)(residual->nb[1]  / sizeof(float)), (uint32_t)(residual->nb[2] / sizeof(float)),
+        (uint32_t)(block_out->nb[0] / sizeof(float)), (uint32_t)(block_out->nb[1] / sizeof(float)),
+        (uint32_t)(inject->nb[0]    / sizeof(float)), (uint32_t)(inject->nb[1]    / sizeof(float)),
+        (uint32_t)(dst->nb[0]       / sizeof(float)), (uint32_t)(dst->nb[1]       / sizeof(float)), (uint32_t)(dst->nb[2] / sizeof(float)),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, residual), ggml_vk_tensor_subbuffer(ctx, block_out),
+         ggml_vk_tensor_subbuffer(ctx, inject), ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, {nr, 1, 1});
+}
+
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -17608,6 +17649,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_Q4X_HC_COMBINE:
+        ggml_vk_q4x_hc_combine(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_SSM_SCAN:
         ggml_vk_ssm_scan(ctx, compute_ctx, node);
 
@@ -20460,6 +20506,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_Q4X_HC_COMBINE:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 const ggml_tensor * q = op->src[0];

@@ -827,6 +827,7 @@ void process_shaders() {
     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
+    string_to_spv("q4x_hc_combine_f32", "q4x_hc_combine.comp", {});
 
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
     string_to_spv("mul_mat_vec_p021_f16_f32",              "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});

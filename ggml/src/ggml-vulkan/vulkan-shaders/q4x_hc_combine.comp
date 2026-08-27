@@ -1,0 +1,43 @@
+#version 450
+
+// qwen4exp fused hyper-connection combine (mirrors build_hc_combine):
+//   dst[i0, ih, it] = residual[i0, ih, it] + block_out[i0, it] * 2*sigmoid(inject[ih, it] / hc)
+// residual [n_embd, hc, n_tokens], block_out [n_embd, n_tokens], inject [hc, n_tokens]
+// -> [n_embd, hc, n_tokens]. Flat elementwise over n_embd * hc * n_tokens.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer RBuf { float data_r[]; };
+layout(binding = 1) readonly  buffer BBuf { float data_b[]; };
+layout(binding = 2) readonly  buffer IBuf { float data_i[]; };
+layout(binding = 3) writeonly buffer DBuf { float data_d[]; };
+
+layout(push_constant) uniform Parameters {
+    uint n_embd;
+    uint hc;
+    uint nr;      // n_embd * hc * n_tokens
+    uint sr0, sr1, sr2;
+    uint sb0, sb1;
+    uint si0, si1;
+    uint sd0, sd1, sd2;
+} p;
+
+void main() {
+    const uint ir = gl_GlobalInvocationID.x;
+    if (ir >= p.nr) {
+        return;
+    }
+
+    const uint i0 = ir % p.n_embd;
+    const uint ih = (ir / p.n_embd) % p.hc;
+    const uint it = ir / (p.n_embd * p.hc);
+
+    const float inv_hc = 1.0 / float(p.hc);
+    const float iv = data_i[ih * p.si0 + it * p.si1];
+    const float w  = 2.0 / (1.0 + exp(-iv * inv_hc));   // 2*sigmoid(iv / hc)
+
+    const float rv = data_r[i0 * p.sr0 + ih * p.sr1 + it * p.sr2];
+    const float bv = data_b[i0 * p.sb0 + it * p.sb1];
+
+    data_d[i0 * p.sd0 + ih * p.sd1 + it * p.sd2] = rv + bv * w;
+}

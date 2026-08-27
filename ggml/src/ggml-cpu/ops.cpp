@@ -11246,6 +11246,79 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// ggml_compute_forward_q4x_hc_combine
+
+static void ggml_compute_forward_q4x_hc_combine_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * residual  = dst->src[0];
+    const ggml_tensor * block_out = dst->src[1];
+    const ggml_tensor * inject    = dst->src[2];
+
+    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type    == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
+
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = residual->ne[2];
+
+    GGML_ASSERT(dst->ne[0] == n_embd);
+    GGML_ASSERT(dst->ne[1] == hc);
+    GGML_ASSERT(dst->ne[2] == n_tokens);
+    GGML_ASSERT(block_out->ne[0] == n_embd);
+    GGML_ASSERT(block_out->ne[1] == n_tokens);
+    GGML_ASSERT(inject->ne[0] == hc);
+    GGML_ASSERT(inject->ne[1] == n_tokens);
+
+    GGML_TENSOR_LOCALS(size_t, nbr, residual,  nb);
+    GGML_TENSOR_LOCALS(size_t, nbb, block_out, nb);
+    GGML_TENSOR_LOCALS(size_t, nbi, inject,    nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,       nb);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const float inv_hc = 1.0f / (float) hc;
+
+    const int64_t nr  = n_embd * hc * n_tokens;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i0 = ir % n_embd;
+        const int64_t ih = (ir / n_embd) % hc;
+        const int64_t it = ir / (n_embd * hc);
+
+        const float rv = *(const float *) ((const char *) residual->data  + i0*nbr0 + ih*nbr1 + it*nbr2);
+        const float bv = *(const float *) ((const char *) block_out->data + i0*nbb0 + it*nbb1);
+        const float iv = *(const float *) ((const char *) inject->data    + ih*nbi0 + it*nbi1);
+
+        const float w = 2.0f / (1.0f + expf(-iv * inv_hc));  // 2*sigmoid(iv / hc)
+
+        *(float *) ((char *) dst->data + i0*nbd0 + ih*nbd1 + it*nbd2) = rv + bv * w;
+    }
+}
+
+void ggml_compute_forward_q4x_hc_combine(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_q4x_hc_combine_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

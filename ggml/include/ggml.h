@@ -574,6 +574,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_Q4X_HC_COMBINE,
 
         GGML_OP_UNARY,
 
@@ -2663,6 +2664,16 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // qwen4exp fused hyper-connection combine (mirrors build_hc_combine):
+    //   out[i, h, t] = residual[i, h, t] + block_out[i, t] * 2*sigmoid(inject[h, t] / hc)
+    // residual [n_embd, hc, n_tokens], block_out [n_embd, n_tokens], inject [hc, n_tokens]
+    // -> [n_embd, hc, n_tokens]; hc comes from residual->ne[1], the 1/hc and 2x are baked in.
+    GGML_API struct ggml_tensor * ggml_q4x_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * inject);
 
     // custom operators
 
