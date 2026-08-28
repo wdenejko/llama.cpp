@@ -544,16 +544,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
-            // everything below is per token, so drop the rows that produce no output
-            cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
-            inject = ggml_get_rows(ctx0, inject, inp_out_ids);
-
-            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
-            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
-            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
-        }
-
+        // The output-row gather is deferred to after the loop (see t_h_nextn below):
+        // the MTP head reads every token's wide hidden state, which the nextn extraction
+        // copies unmasked over n_tokens, so res_hc must stay full through the last layer.
         res_hc = build_hc_combine(res_hc, cur, inject, il);
 
         cur = build_hc_mix(res_hc,
@@ -576,7 +569,16 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // reads all hc streams, which is what its hnorm is sized for. res_hc is passed as is
     // rather than reshaped: a bare view is not a node the scheduler places, and the
     // extraction is a flat copy, for which [n_embd, hc, T] and [hc*n_embd, T] are identical.
+    // hand the full-width residual (every token) to the MTP head; the nextn extraction
+    // reads all n_tokens rows unmasked, so this must not be collapsed to output rows
     res->t_h_nextn = res_hc;
+
+    // now drop the rows that produce no output: the head and logits are per-output
+    if (inp_out_ids) {
+        res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+        res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+    }
 
     // the final mixer is the output norm: there is no separate one
     ggml_tensor * cur = build_hc_mix(res_hc,
