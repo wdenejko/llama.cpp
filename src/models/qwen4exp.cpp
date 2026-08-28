@@ -1,6 +1,7 @@
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
+#include <cstdlib>
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
@@ -355,7 +356,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
-    // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
+    // 2*sigmoid centres the scatter weights on 1, so an untrained injection matrix
+    // reproduces the plain residual add
+    // escape hatch: Q4X_HC_NOFUSE=1 forces the primitive path (A/B correctness checks)
+    static const bool q4x_hc_nofuse = getenv("Q4X_HC_NOFUSE") != nullptr;
+    if (cparams.fused_q4x_hc_comb && il >= 0 && !q4x_hc_nofuse) {
+        ggml_tensor * fused = ggml_q4x_hc_combine(ctx0, residual, block_out, inject);
+        res->add_fused_node({LLM_FUSED_OP_Q4X_HC_COMBINE, fused, il});
+        cb(fused, "hc_combine", il);
+        return fused;
+    }
+
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);
     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
