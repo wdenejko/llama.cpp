@@ -256,7 +256,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     cb(mixed, "hc_mixed", il);
 
     if (inject) {
-        *inject = build_lora_mm(w_inject, xn);
+        // The inject projection is w_inject^T @ xn, i.e. M = hc (= 4), N = n_tokens: a
+        // pathological small-M GEMM. On Vulkan/gfx1151 the tiled matmul wastes all but
+        // hc rows of its M-tile, so this single op costs ~16% of prefill GPU time.
+        // Compute it transposed instead -- mul_mat(xn, w_inject) has N = hc, which is
+        // <= mul_mat_vec_max_cols, so the backend dispatches the efficient GEMV
+        // (mul_mat_vec) path -- then transpose the tiny [n_tokens, hc] result back.
+        // Falls back to the plain path if a LoRA adapter targets w_inject.
+        bool inject_has_lora = false;
+        for (const auto & lora : *loras) {
+            if (lora.first->get_weight(w_inject)) { inject_has_lora = true; break; }
+        }
+        if (inject_has_lora) {
+            *inject = build_lora_mm(w_inject, xn);
+        } else {
+            ggml_tensor * inj_t = ggml_mul_mat(ctx0, xn, w_inject);   // [n_tokens, hc]
+            *inject = ggml_cont(ctx0, ggml_transpose(ctx0, inj_t));   // [hc, n_tokens]
+        }
         cb(*inject, "hc_inject", il);
     }
 
