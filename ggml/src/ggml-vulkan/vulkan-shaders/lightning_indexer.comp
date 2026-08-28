@@ -3,149 +3,90 @@
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_KHR_shader_subgroup_basic : enable
-#if USE_SUBGROUP_ADD
-#extension GL_KHR_shader_subgroup_arithmetic : enable
-#endif
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
 
-#define BINDING_IDX_K 0u
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 64;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-#include "types.glsl"
-#include "fa_types.glsl"
-#define FaTypeV FA_TYPE_F32
+layout(binding = 0) readonly  buffer QBuf    { float     data_q[];   };
+layout(binding = 1) readonly  buffer KBuf    { float16_t data_k[];   };
+layout(binding = 2) readonly  buffer WBuf    { float     data_w[];   };
+layout(binding = 3) readonly  buffer MaskBuf { float16_t data_m[];   };
+layout(binding = 4) writeonly buffer DstBuf  { float     data_dst[]; };
 
-layout(constant_id = 0) const uint FaTypeK = FA_TYPE_F32;
-layout(constant_id = 1) const uint FaBlockBytesK = 4;
-layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
-
-#include "flash_attn_dequant.glsl"
-
-// one workgroup computes one output element, one invocation per head element
-#define HEAD_SIZE 128
-
-layout(local_size_x = HEAD_SIZE, local_size_y = 1, local_size_z = 1) in;
-
-layout(binding = 0) readonly buffer QBuf { float q[]; };
-layout(binding = 1) readonly buffer KBufF16 { float16_t k_f16[]; };
-layout(binding = 1) readonly buffer KBufF32 { float k_f32[]; };
-layout(binding = 1) readonly buffer KBufBF16 { uint16_t k_bf16[]; };
-layout(binding = 2) readonly buffer WBuf { float weights[]; };
-layout(binding = 3) readonly buffer MBuf { float16_t mask[]; };
-layout(binding = 4) writeonly buffer DstBuf { float dst[]; };
-
-layout(push_constant) uniform PushConstants {
+layout(push_constant) uniform Parameters {
     uint n_kv;
-    uint n_heads;
-    uint n_tokens;
-    uint n_streams;
-    uint n_masks;
-    uint dispatch_x;
-    uint q_nb1;
-    uint q_nb2;
-    uint q_nb3;
-    uint k_nb2;
-    uint k_nb3;
-    uint w_nb1;
-    uint w_nb3;
-    uint m_nb1;
-    uint m_nb3;
-    uint d_nb1;
-    uint d_nb3;
-};
+    uint n_batch;
+    uint n_stream;
+    uint nem3;
+    uint nb1;
+    uint nb3;
+    uint nbq1;
+    uint nbq2;
+    uint nbq3;
+    uint nbk2;
+    uint nbk3;
+    uint nbw1;
+    uint nbw3;
+    uint nbm1;
+    uint nbm3;
+} p;
 
-shared float k_row[HEAD_SIZE];
-
-#if USE_SUBGROUP_ADD
-shared float sg_partials[HEAD_SIZE / SUBGROUP_SIZE];
-#else
-shared float partials[HEAD_SIZE];
-#endif
+const uint K_PER_GROUP = 8;
+const uint N_HEAD = 64;
 
 void main() {
-    const uint tid = gl_LocalInvocationID.x;
-    const uint output_idx = gl_WorkGroupID.y * dispatch_x + gl_WorkGroupID.x;
-    const uint n_outputs = n_kv * n_tokens * n_streams;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint token = gl_WorkGroupID.y;
+    const uint stream = gl_WorkGroupID.z;
+    const uint kv_base = gl_WorkGroupID.x * K_PER_GROUP;
 
-    if (fa_type_needs_shmem(FaTypeK)) {
-        init_iq_shmem(gl_WorkGroupSize);
-    }
-
-    if (output_idx >= n_outputs) {
+    if (token >= p.n_batch || stream >= p.n_stream) {
         return;
     }
 
-    const uint ik = output_idx % n_kv;
-    const uint ts = output_idx / n_kv;
-    const uint t = ts % n_tokens;
-    const uint s = ts / n_tokens;
-    const uint k_offset = ik * k_nb2 + s * k_nb3;
-
-    // k strides come in as bytes, so scale them down to the view being indexed
-    const uint k_block_elems = fa_block_elems(FaTypeK);
-    const uint k_elem_bytes = FaBlockBytesK / k_block_elems;
-
-    if (FaTypeK == FA_TYPE_F16) {
-        k_row[tid] = float(k_f16[k_offset / k_elem_bytes + tid]);
-    } else if (FaTypeK == FA_TYPE_F32) {
-        k_row[tid] = k_f32[k_offset / k_elem_bytes + tid];
-    } else if (FaTypeK == FA_TYPE_BF16) {
-        k_row[tid] = bf16_to_fp32(uint(k_bf16[k_offset / k_elem_bytes + tid]));
-    } else if (4 * tid < HEAD_SIZE) {
-        const uint coord = 4 * tid;
-        const uint ib = coord / k_block_elems;
-        const uint iqs = coord % k_block_elems;
-        const vec4 values = dequantize4(ib, iqs, k_offset / FaBlockBytesK, BINDING_IDX_K);
-        k_row[coord + 0] = values.x;
-        k_row[coord + 1] = values.y;
-        k_row[coord + 2] = values.z;
-        k_row[coord + 3] = values.w;
-    }
-    barrier();
-
-    const float k_val = k_row[tid];
-
-    float score = 0.0;
-    for (uint h = 0; h < n_heads; ++h) {
-        const float prod = q[h * q_nb1 + t * q_nb2 + s * q_nb3 + tid] * k_val;
-
-#if USE_SUBGROUP_ADD
-        const float sg_sum = subgroupAdd(prod);
-        if (gl_SubgroupInvocationID == 0) {
-            sg_partials[gl_SubgroupID] = sg_sum;
+    float k0[K_PER_GROUP];
+    float k1[K_PER_GROUP];
+    [[unroll]] for (uint j = 0; j < K_PER_GROUP; ++j) {
+        const uint kv = kv_base + j;
+        if (kv < p.n_kv) {
+            const uint k_base = stream * p.nbk3 + kv * p.nbk2;
+            k0[j] = float(data_k[k_base + lane]);
+            k1[j] = float(data_k[k_base + lane + SUBGROUP_SIZE]);
+        } else {
+            k0[j] = 0.0;
+            k1[j] = 0.0;
         }
-        barrier();
-
-        if (tid == 0) {
-            float sum = 0.0;
-            [[unroll]] for (uint i = 0; i < HEAD_SIZE / SUBGROUP_SIZE; ++i) {
-                sum += sg_partials[i];
-            }
-            score += max(sum, 0.0) * weights[h + t * w_nb1 + s * w_nb3];
-        }
-        // the reads above must complete before the next iteration overwrites sg_partials
-        barrier();
-#else
-        partials[tid] = prod;
-        barrier();
-
-        [[unroll]] for (uint stride = HEAD_SIZE / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                partials[tid] += partials[tid + stride];
-            }
-            barrier();
-        }
-
-        if (tid == 0) {
-            score += max(partials[0], 0.0) * weights[h + t * w_nb1 + s * w_nb3];
-        }
-        // the read of partials[0] above must complete before the next iteration
-        // overwrites partials[tid]
-        barrier();
-#endif
     }
 
-    if (tid == 0) {
-        const uint mask_offset = ik + t * m_nb1 + (s % n_masks) * m_nb3;
-        dst[ik + t * d_nb1 + s * d_nb3] = score + float(mask[mask_offset]);
+    float score[K_PER_GROUP];
+    [[unroll]] for (uint j = 0; j < K_PER_GROUP; ++j) {
+        score[j] = 0.0;
+    }
+
+    for (uint head = 0; head < N_HEAD; ++head) {
+        const uint q_base = stream * p.nbq3 + token * p.nbq2 + head * p.nbq1;
+        const float q0 = data_q[q_base + lane];
+        const float q1 = data_q[q_base + lane + SUBGROUP_SIZE];
+        const float weight = data_w[stream * p.nbw3 + token * p.nbw1 + head];
+
+        [[unroll]] for (uint j = 0; j < K_PER_GROUP; ++j) {
+            const float qk = subgroupAdd(q0 * k0[j] + q1 * k1[j]);
+            if (lane == 0) {
+                score[j] += max(qk, 0.0) * weight;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        const uint mask_base = (stream % p.nem3) * p.nbm3 + token * p.nbm1;
+        const uint dst_base = stream * p.nb3 + token * p.nb1;
+        [[unroll]] for (uint j = 0; j < K_PER_GROUP; ++j) {
+            const uint kv = kv_base + j;
+            if (kv < p.n_kv) {
+                data_dst[dst_base + kv] = score[j] + float(data_m[mask_base + kv]);
+            }
+        }
     }
 }
