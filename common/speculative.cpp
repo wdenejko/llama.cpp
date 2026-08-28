@@ -152,6 +152,31 @@ struct common_speculative_impl {
 
     std::vector<size_t> n_acc_tokens_per_pos; // number of tokens accepted per draft position.
 
+    // adaptive draft length: EWMA of tokens accepted per round (<0 = unset). Draft roughly as
+    // many as recently accepted, plus one to probe, so low-acceptance stretches stop wasting
+    // draft forwards. Lossless -- the target still verifies every drafted token.
+    double acc_ewma = -1.0;
+
+    int32_t effective_n_max(const common_params_speculative_draft & p) const {
+        if (!p.adaptive || n_call_accept == 0) {
+            return p.n_max;
+        }
+        const int32_t lo = std::max(1, p.n_min);
+        // Draft position i while > tau of rounds accepted at least i+1 tokens -- i.e. while the
+        // marginal draft token clears the draft/verify cost ratio. Draft forwards are not free,
+        // so this cuts off near the acceptance median; tracking the mean over-drafts by ~1.
+        const double tau = 0.6;
+        int32_t n = lo;
+        for (int32_t i = 0; i < p.n_max; ++i) {
+            const double surv = (i < (int32_t) n_acc_tokens_per_pos.size())
+                ? (double) n_acc_tokens_per_pos[i] / (double) n_call_accept : 0.0;
+            if (surv >= tau) { n = i + 1; } else { break; }
+        }
+        if (n < lo) { n = lo; }
+        if ((n_call_accept & 7u) == 0 && n < p.n_max) { n++; } // occasional deeper probe
+        return std::min(n, p.n_max);
+    }
+
     // TODO: track performance of most recent calls
     const bool gen_perf = true; // whether to generate performance stats.
 
@@ -1715,7 +1740,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (effective_n_max(params) <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2918,6 +2943,14 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
         if (n_accepted > 0) {
             impl->n_acc_drafts++;
             impl->n_acc_tokens += n_accepted;
+        }
+
+        // adaptive draft length: EWMA over accepted-per-round (zero-accept rounds included)
+        {
+            const double beta = 0.2;
+            impl->acc_ewma = impl->acc_ewma < 0.0
+                ? (double) n_accepted
+                : (1.0 - beta) * impl->acc_ewma + beta * (double) n_accepted;
         }
 
         impl->accept(seq_id, n_accepted, false);

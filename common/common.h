@@ -331,6 +331,8 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    bool adaptive = false; // adaptive draft length: size from recent acceptance, within [n_min, n_max]
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
