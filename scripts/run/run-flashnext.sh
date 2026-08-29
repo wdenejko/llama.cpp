@@ -87,11 +87,28 @@ if [ "$MTP" = "1" ] && [ "$COOPMAT" != "0" ] && pgrep -f "build-v2/bin/[l]lama-s
   exit 1
 fi
 
-# Free GPU/host memory for the ~103GB model: stop comfyui/OCR, wait for headroom, and restore them on exit.
+# Clean shutdown: kill the server and (if we stopped them) restart the user's services. The server runs
+# inside the toolbox via `toolbox run`; a signal to this script kills the toolbox-run client but can ORPHAN
+# the containerized llama-server (podman only forwards the signal with a TTY), leaving it holding ~85GB GTT
+# while the services come back = contention. So pkill it explicitly (the toolbox shares the host PID ns).
+# Fires on normal exit and on Ctrl-C/TERM; defined AFTER the refuse-check above so it never touches a
+# pre-existing server.
+_FREED=0
+_shutdown() {
+  pkill -f "build-v2/bin/[l]lama-server" 2>/dev/null || true
+  if [ "$_FREED" = "1" ]; then
+    sleep 2
+    echo "[run-flashnext] restarting comfyui + OCR" >&2
+    systemctl --user start dashi-unlimited-ocr.service comfyui.service 2>/dev/null || true
+  fi
+}
+trap _shutdown EXIT INT TERM
+
+# Free GPU/host memory for the ~103GB model: stop comfyui/OCR and wait for headroom (restored on exit above).
 if [ "$FREE_GPU" = "1" ]; then
   echo "[run-flashnext] stopping comfyui + OCR to free memory (FREE_GPU=0 to skip)" >&2
   systemctl --user stop dashi-unlimited-ocr.service comfyui.service 2>/dev/null || true
-  trap 'echo "[run-flashnext] restarting comfyui + OCR" >&2; systemctl --user start dashi-unlimited-ocr.service comfyui.service 2>/dev/null || true' EXIT INT TERM
+  _FREED=1
   _gttf=$(ls /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1)
   g=0; a=0
   for _ in $(seq 1 40); do            # up to ~80s for GTT to drain and RAM headroom for the load
