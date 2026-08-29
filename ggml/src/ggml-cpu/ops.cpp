@@ -8432,6 +8432,12 @@ static void ggml_compute_forward_top_k_f32(
 
     const int top_k = ne0;
 
+    // GGML_TOPK_LOG=1: log every CPU top_k dispatch (shape + this thread's wall time). The Vulkan
+    // backend rejects TOP_K with k >= 1024, so wide selections (e.g. QSA indexer widths) silently
+    // land here with a GPU sync + transfer per split -- this makes that visible.
+    static const bool topk_log = getenv("GGML_TOPK_LOG") != nullptr;
+    const int64_t t_log_us = (topk_log && ith == 0) ? ggml_time_us() : 0;
+
     int32_t * tmp = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
     for (int64_t i = ith; i < nr; i += nth) {
@@ -8451,6 +8457,11 @@ static void ggml_compute_forward_top_k_f32(
         if (top_k > 1) {
             std::swap(dst_data[0], dst_data[1]);
         }
+    }
+
+    if (topk_log && ith == 0) {
+        fprintf(stderr, "[topk-cpu] n=%lld rows=%lld k=%d t=%.2fms\n",
+                (long long) ne00, (long long) nr, top_k, (ggml_time_us() - t_log_us)/1000.0);
     }
 }
 
