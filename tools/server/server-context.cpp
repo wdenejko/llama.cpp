@@ -256,6 +256,13 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    // Livelock guard for the recurrent-rollback path (see the checkpoint-restore rollback in
+    // update_slots). A coopmat verify can deterministically reject a draft at a recurrent boundary;
+    // because n_rollback > n_rs_seq then forces a full checkpoint restore every step, the replay can
+    // re-reject and restore forever with no forward progress. These track repeated restores at one
+    // checkpoint position so we can cap the replay and force progress.
+    llama_pos spec_guard_pos   = -1;
+    int       spec_guard_count = 0;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -370,6 +377,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_guard_pos   = -1;
+        spec_guard_count = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -3913,6 +3922,27 @@ private:
 
                         const auto & ckpt = slot.spec_ckpt;
 
+                        // Livelock guard. Under coopmat the target can deterministically reject the
+                        // draft at this recurrent boundary; since n_rollback > n_rs_seq forces a full
+                        // checkpoint restore each step, the replay re-rejects and restores forever with
+                        // no forward progress (observed: ~900 restores of a 118 MiB checkpoint at a
+                        // fixed pos until the client cancels). When we restore to the same checkpoint
+                        // position repeatedly, cap the replay draft to n_rs_seq so the next verify takes
+                        // the RS partial-rollback path (which advances) instead of restoring again.
+                        // Lossless: the capped tokens were target-accepted and are simply re-drafted on
+                        // the following step.
+                        if (ckpt.pos_max == slot.spec_guard_pos) {
+                            if (++slot.spec_guard_count >= 2) {
+                                const size_t cap = std::max<size_t>(1, (size_t) llama_n_rs_seq(slot.ctx_tgt));
+                                if (slot.spec_draft.size() > cap) {
+                                    slot.spec_draft.resize(cap);
+                                }
+                            }
+                        } else {
+                            slot.spec_guard_pos   = ckpt.pos_max;
+                            slot.spec_guard_count = 0;
+                        }
+
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
                         ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3946,6 +3976,10 @@ private:
                 n_accepted--;
             }
             slot.spec_is_replay = false;
+
+            // forward progress was made -> clear the recurrent-rollback livelock guard
+            slot.spec_guard_pos   = -1;
+            slot.spec_guard_count = 0;
 
             slot.stats.update_gen_last();
 
