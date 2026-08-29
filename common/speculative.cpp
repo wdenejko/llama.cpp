@@ -2532,6 +2532,14 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
+    // the draft context otherwise inherits the target's n_ubatch; a smaller draft ubatch shrinks the
+    // draft's ubatch-scaled compute/mask buffers (a second full set on top of the target's), which is
+    // what allows a wide-target-ubatch prefill to fit at deep context on a shared memory budget.
+    // llama_decode splits target-ubatch-sized draft batches into draft ubatches internally.
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
+
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types
     //       something like `struct common_speculative_type_props common_speculative_type_get_props(...);`
