@@ -19786,8 +19786,24 @@ static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_even
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
     if (vkev->has_event) {
-        // Wait for latest event
-        ggml_vk_wait_events(compute_ctx, { vkev->event });
+        // Cross-backend/-context dependency (CPU<->Vulkan graph splits; and, under speculative
+        // decode, two llama contexts sharing one compute queue). The in-cmdbuf vkCmdWaitEvents is
+        // ORDER-DEPENDENT: its submission must be enqueued after the matching setEvent. With coopmat
+        // the matmul path emits a different number/shape of submissions, which can enqueue this
+        // waiter AHEAD of the setter on the shared queue -> WaitEvents blocks on an event signalled
+        // only by a submission behind it -> the queue stalls, ctx->fence never signals, GPU goes
+        // idle with no device-lost. RADV_DEBUG=hang (full shader serialization) closes the reorder
+        // window and the hang vanishes, which is what identifies this as an ordering race, not a
+        // shader hang. Enforce the dependency at the QUEUE level via the event's timeline semaphore
+        // instead (the async-transfer branch below already trusts it): a timeline value-wait is
+        // order-independent, so it resolves no matter how coopmat reorders the submissions. Gated to
+        // the coopmat path (the only one that races); GGML_VK_EVENT_TL_OFF forces the old path.
+        if (ctx->device->coopmat_support && !getenv("GGML_VK_EVENT_TL_OFF")) {
+            compute_ctx->s->wait_semaphores.push_back(vkev->tl_semaphore);
+        } else {
+            // Wait for latest event
+            ggml_vk_wait_events(compute_ctx, { vkev->event });
+        }
 
         if (ctx->device->async_use_transfer_queue) {
             vk_context transfer_ctx = ggml_vk_get_transfer_ctx(ctx);
