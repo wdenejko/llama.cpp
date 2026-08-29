@@ -6,7 +6,7 @@
 #   temp 0 + code @ ~32k:     16.1 -> 28.9 (+79%);   @ ~64k: 12.0 -> 25.8 (+115%).
 # Rule: enable MTP only for DETERMINISTIC work (code / tools / extraction) run at TEMP=0.
 # Q4_K_XL is the only quant we keep. Creative sampling = unsloth thinking-mode rec.
-# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048]
+# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1]
 #   Creative/chat (default):     ./run-flashnext.sh
 #   Fast deterministic code:     MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
 export PATH="$PATH:/usr/sbin:/sbin"
@@ -30,6 +30,9 @@ PARALLEL="${PARALLEL:-1}"            # 1 = single stream = fastest PER REQUEST; 
 UB="${UB:-2048}"                     # physical batch. MEASURED pp4096 on this box: 512->2048 is +25% coopmat-OFF
                                      # (386->484) and +14% coopmat-ON (494->564); plateaus by 3072. ub2048 verified
                                      # NON-OOM at full 131072 ctx (peak 87GB / 121GB free). Was 512.
+COOPMAT="${COOPMAT:-1}"              # KHR_coopmat matmul. 1 = ON (default): recovers prefill (~+16% shallow,
+                                     # ~+40% @128k), and is safe under MTP since the event fix (81aa39c17).
+                                     # 0 = force OFF (GGML_VK_DISABLE_COOPMAT=1) as a regression fallback.
 
 case "$QUANT" in
   Q4_K_XL) MODEL="$MODELS/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf" ;;
@@ -55,24 +58,48 @@ esac
 
 MTP_ARGS=()
 VK_ENV=()
+# COOPMAT=0 is a global kill switch forcing KHR_coopmat OFF (regression fallback). Default is ON.
+[ "$COOPMAT" = "0" ] && VK_ENV=(GGML_VK_DISABLE_COOPMAT=1)
 if [ "$MTP" = "1" ]; then
-  # draft-mtp ONLY. Do NOT add ngram-mod (its 48-64 tok drafts only make the bug below worse).
+  # draft-mtp ONLY. Do NOT add ngram-mod (its 48-64 tok drafts regress acceptance here).
   # p-min 0.75 gates low-confidence drafts (keeps prose from regressing).
   MTP_ARGS=(-md "$MD" --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75)
-  # REQUIRED with MTP: without this the GPU DEADLOCKS mid-run. Root-caused 2026-08-28: a KHR_coopmat
-  # matmul shader hangs (Vulkan fence never signals; llama_decode spins forever in ggml_vk_wait_for_fence;
-  # no device-lost) on the small speculative verify/draft batch shapes. By elimination f16b-off,
-  # GGML_VK_SERIALIZE_SUBMISSIONS=1 and --flash-attn off ALL still hang; only disabling coopmat fixes it
-  # (repro 30/30 clean). Decode stays full-speed (33-36 t/s, accept 0.90); only cold-prefill matmul is slower.
-  VK_ENV=(GGML_VK_DISABLE_COOPMAT=1)
+  # HISTORY: coopmat under MTP used to DEADLOCK the GPU — a KHR_coopmat matmul shader's Vulkan fence never
+  # signalled on the small speculative batch shapes (llama_decode spun in ggml_vk_wait_for_fence, no
+  # device-lost). FIXED 2026-08-29 by ordering the cross-backend event wait through its timeline semaphore
+  # (commit 81aa39c17). VALIDATED: coopmat-ON MTP ran 20 min / 84 code gens with 0 deadlocks, 0 livelocks,
+  # 0 stalls at full decode speed (32-37 t/s). The old OFF workaround is now opt-in via COOPMAT=0. The
+  # coopmat-ON graph init is GTT-sensitive under memory pressure -> see the launch preamble below.
   if [ "$TEMP" != "0" ] && [ "$TEMP" != "0.0" ]; then
     echo "[run-flashnext] WARNING: MTP=1 with TEMP=$TEMP is pointless — MTP is a WASH above temp 0 (measured 25.7 vs 25.8)." >&2
     echo "[run-flashnext]          It only speeds up greedy decode. Set TEMP=0, or use MTP=0 to save ~4GB on the draft model." >&2
   fi
 fi
 
-echo "[run-flashnext] build=build-v2 quant=$QUANT ctx=$CTX ngl=$NGL fa=$FA port=$PORT ngram_offload=$NGRAM_OFFLOAD reasoning=$REASONING temp=$TEMP mtp=$MTP parallel=$PARALLEL" >&2
-podman start "$TOOLBOX" >/dev/null 2>&1 || true
+echo "[run-flashnext] build=build-v2 quant=$QUANT ctx=$CTX ngl=$NGL fa=$FA port=$PORT ngram_offload=$NGRAM_OFFLOAD reasoning=$REASONING temp=$TEMP mtp=$MTP coopmat=$COOPMAT parallel=$PARALLEL" >&2
+# Launch preamble. The coopmat-ON MTP graph init is sensitive to GTT still held by a just-exited server:
+# under memory pressure graph_reserve can wedge into an unkillable amdgpu D-state (needs a GPU reset/reboot).
+# On that path only: refuse to stack a second server, let a prior server's GTT finish draining, and start
+# the toolbox fresh. Every other path keeps the original fast `podman start`.
+if [ "$MTP" = "1" ] && [ "$COOPMAT" != "0" ]; then
+  if pgrep -f "build-v2/bin/[l]lama-server" >/dev/null 2>&1; then
+    echo "[run-flashnext] a build-v2 llama-server is already running — stop it before launching coopmat-ON MTP." >&2
+    exit 1
+  fi
+  _gtt() { echo $(( $(cat /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1) / 1073741824 )); }
+  _prev=$(_gtt); _stable=0
+  for _ in $(seq 1 15); do            # wait up to ~30s for a just-exited server's GTT to finish draining
+    sleep 2; _cur=$(_gtt)
+    if [ "$_cur" -le "$_prev" ]; then _stable=$((_stable+1)); else _stable=0; fi
+    [ "$_stable" -ge 2 ] && break
+    _prev=$_cur
+  done
+  echo "[run-flashnext] gtt=$(_gtt)GB stable; restarting toolbox for a clean coopmat-ON graph init" >&2
+  podman restart "$TOOLBOX" >/dev/null 2>&1 || podman start "$TOOLBOX" >/dev/null 2>&1 || true
+  sleep 2
+else
+  podman start "$TOOLBOX" >/dev/null 2>&1 || true
+fi
 exec toolbox run --container "$TOOLBOX" env "${VK_ENV[@]}" LD_LIBRARY_PATH="$BIN" \
   "$BIN/llama-server" -m "$MODEL" \
     --alias flashnext --host 0.0.0.0 --port "$PORT" \
