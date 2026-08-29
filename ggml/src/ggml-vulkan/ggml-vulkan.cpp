@@ -19787,27 +19787,40 @@ static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_even
 
     if (vkev->has_event) {
         // Cross-backend/-context dependency (CPU<->Vulkan graph splits; and, under speculative
-        // decode, two llama contexts sharing one compute queue). The in-cmdbuf vkCmdWaitEvents is
-        // ORDER-DEPENDENT: its submission must be enqueued after the matching setEvent. With coopmat
-        // the matmul path emits a different number/shape of submissions, which can enqueue this
-        // waiter AHEAD of the setter on the shared queue -> WaitEvents blocks on an event signalled
-        // only by a submission behind it -> the queue stalls, ctx->fence never signals, GPU goes
-        // idle with no device-lost. RADV_DEBUG=hang (full shader serialization) closes the reorder
-        // window and the hang vanishes, which is what identifies this as an ordering race, not a
-        // shader hang. Enforce the dependency at the QUEUE level via the event's timeline semaphore
-        // instead (the async-transfer branch below already trusts it): a timeline value-wait is
-        // order-independent, so it resolves no matter how coopmat reorders the submissions. Gated to
-        // the coopmat path (the only one that races); GGML_VK_EVENT_TL_OFF forces the old path.
-        if (ctx->device->coopmat_support && !getenv("GGML_VK_EVENT_TL_OFF")) {
+        // decode, two llama contexts sharing one compute queue). ANY device-side wait here -- the
+        // in-cmdbuf vkCmdWaitEvents OR a submission-level timeline-semaphore wait -- is unsafe on
+        // the SHARED queue: same-queue submissions execute in order, so a wait whose submission
+        // lands ahead of the setter's signal blocks the queue, which then never reaches the signal
+        // -> ctx->fence never fires, GPU sits idle with no device-lost and no kernel fault. (An
+        // earlier fix moved WaitEvents to a timeline wait; timeline value-waits are only
+        // order-independent ACROSS queues, so it merely narrowed the race window: with coopmat's
+        // submission batching under MTP the wedge still hit at ~1% of requests, blocked in
+        // drmSyncobjWait.) Resolve the dependency on the HOST instead: event_record submits the
+        // signal immediately, and with no device-side wait ever enqueued the queue always drains,
+        // so this wait is finite by construction. The sched uses this wait to guard input-copy
+        // reuse, so a host-side block here is semantically exact and costs one sync per split
+        // input reuse. Gated to the coopmat path (the only one observed to race);
+        // GGML_VK_EVENT_DEVICE_WAIT restores the old device-side timeline wait for A/B.
+        if (ctx->device->coopmat_support && !getenv("GGML_VK_EVENT_DEVICE_WAIT")) {
+            vk::Semaphore sem = vkev->tl_semaphore.s;
+            uint64_t val = vkev->tl_semaphore.value;
+            vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, sem, val};
+            VK_CHECK(ctx->device->device.waitSemaphores(swi, UINT64_MAX), "event_wait host", ctx->device);
+        } else if (ctx->device->coopmat_support) {
             compute_ctx->s->wait_semaphores.push_back(vkev->tl_semaphore);
+
+            if (ctx->device->async_use_transfer_queue) {
+                vk_context transfer_ctx = ggml_vk_get_transfer_ctx(ctx);
+                transfer_ctx->s->wait_semaphores.push_back(vkev->tl_semaphore);
+            }
         } else {
             // Wait for latest event
             ggml_vk_wait_events(compute_ctx, { vkev->event });
-        }
 
-        if (ctx->device->async_use_transfer_queue) {
-            vk_context transfer_ctx = ggml_vk_get_transfer_ctx(ctx);
-            transfer_ctx->s->wait_semaphores.push_back(vkev->tl_semaphore);
+            if (ctx->device->async_use_transfer_queue) {
+                vk_context transfer_ctx = ggml_vk_get_transfer_ctx(ctx);
+                transfer_ctx->s->wait_semaphores.push_back(vkev->tl_semaphore);
+            }
         }
     }
 }
