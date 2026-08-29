@@ -6,7 +6,7 @@
 #   temp 0 + code @ ~32k:     16.1 -> 28.9 (+79%);   @ ~64k: 12.0 -> 25.8 (+115%).
 # Rule: enable MTP only for DETERMINISTIC work (code / tools / extraction) run at TEMP=0.
 # Q4_K_XL is the only quant we keep. Creative sampling = unsloth thinking-mode rec.
-# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1]
+# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1] [FREE_GPU=1]
 #   Creative/chat (default):     ./run-flashnext.sh
 #   Fast deterministic code:     MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
 export PATH="$PATH:/usr/sbin:/sbin"
@@ -33,6 +33,8 @@ UB="${UB:-2048}"                     # physical batch. MEASURED pp4096 on this b
 COOPMAT="${COOPMAT:-1}"              # KHR_coopmat matmul. 1 = ON (default): recovers prefill (~+16% shallow,
                                      # ~+40% @128k), and is safe under MTP since the event fix (81aa39c17).
                                      # 0 = force OFF (GGML_VK_DISABLE_COOPMAT=1) as a regression fallback.
+FREE_GPU="${FREE_GPU:-1}"            # 1 = stop comfyui/OCR + wait for GTT/RAM headroom before the ~103GB
+                                     # load, and restart them when the server exits. 0 = leave services be.
 
 case "$QUANT" in
   Q4_K_XL) MODEL="$MODELS/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf" ;;
@@ -76,31 +78,52 @@ if [ "$MTP" = "1" ]; then
   fi
 fi
 
-echo "[run-flashnext] build=build-v2 quant=$QUANT ctx=$CTX ngl=$NGL fa=$FA port=$PORT ngram_offload=$NGRAM_OFFLOAD reasoning=$REASONING temp=$TEMP mtp=$MTP coopmat=$COOPMAT parallel=$PARALLEL" >&2
-# Launch preamble. The coopmat-ON MTP graph init is sensitive to GTT still held by a just-exited server:
-# under memory pressure graph_reserve can wedge into an unkillable amdgpu D-state (needs a GPU reset/reboot).
-# On that path only: refuse to stack a second server, let a prior server's GTT finish draining, and start
-# the toolbox fresh. Every other path keeps the original fast `podman start`.
-if [ "$MTP" = "1" ] && [ "$COOPMAT" != "0" ]; then
-  if pgrep -f "build-v2/bin/[l]lama-server" >/dev/null 2>&1; then
-    echo "[run-flashnext] a build-v2 llama-server is already running — stop it before launching coopmat-ON MTP." >&2
-    exit 1
-  fi
+echo "[run-flashnext] build=build-v2 quant=$QUANT ctx=$CTX ngl=$NGL fa=$FA port=$PORT ngram_offload=$NGRAM_OFFLOAD reasoning=$REASONING temp=$TEMP mtp=$MTP coopmat=$COOPMAT free_gpu=$FREE_GPU parallel=$PARALLEL" >&2
+
+# Don't stack a second server on the coopmat-ON MTP path: its graph init can wedge graph_reserve into an
+# unkillable amdgpu D-state (needs a GPU reset/reboot) when a prior server's GTT is still held.
+if [ "$MTP" = "1" ] && [ "$COOPMAT" != "0" ] && pgrep -f "build-v2/bin/[l]lama-server" >/dev/null 2>&1; then
+  echo "[run-flashnext] a build-v2 llama-server is already running — stop it before launching coopmat-ON MTP." >&2
+  exit 1
+fi
+
+# Free GPU/host memory for the ~103GB model: stop comfyui/OCR, wait for headroom, and restore them on exit.
+if [ "$FREE_GPU" = "1" ]; then
+  echo "[run-flashnext] stopping comfyui + OCR to free memory (FREE_GPU=0 to skip)" >&2
+  systemctl --user stop dashi-unlimited-ocr.service comfyui.service 2>/dev/null || true
+  trap 'echo "[run-flashnext] restarting comfyui + OCR" >&2; systemctl --user start dashi-unlimited-ocr.service comfyui.service 2>/dev/null || true' EXIT INT TERM
+  _gttf=$(ls /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1)
+  g=0; a=0
+  for _ in $(seq 1 40); do            # up to ~80s for GTT to drain and RAM headroom for the load
+    g=$(( $(cat "$_gttf" 2>/dev/null)/1073741824 )); a=$(free -g | awk '/^Mem:/{print $7}')
+    [ "$g" -lt 6 ] && [ "$a" -ge 110 ] && break
+    sleep 2
+  done
+  echo "[run-flashnext] memory ready: gtt=${g}GB free_ram=${a}GB" >&2
+elif [ "$MTP" = "1" ] && [ "$COOPMAT" != "0" ]; then
+  # FREE_GPU off but coopmat-ON: still let a just-exited server's GTT finish draining before graph init.
   _gtt() { echo $(( $(cat /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1) / 1073741824 )); }
   _prev=$(_gtt); _stable=0
-  for _ in $(seq 1 15); do            # wait up to ~30s for a just-exited server's GTT to finish draining
+  for _ in $(seq 1 15); do
     sleep 2; _cur=$(_gtt)
     if [ "$_cur" -le "$_prev" ]; then _stable=$((_stable+1)); else _stable=0; fi
     [ "$_stable" -ge 2 ] && break
     _prev=$_cur
   done
-  echo "[run-flashnext] gtt=$(_gtt)GB stable; restarting toolbox for a clean coopmat-ON graph init" >&2
+  echo "[run-flashnext] gtt=$(_gtt)GB stable" >&2
+fi
+
+# Start the toolbox — restart it fresh on the coopmat-ON MTP path so graph init sees a clean container.
+if [ "$MTP" = "1" ] && [ "$COOPMAT" != "0" ]; then
   podman restart "$TOOLBOX" >/dev/null 2>&1 || podman start "$TOOLBOX" >/dev/null 2>&1 || true
   sleep 2
 else
   podman start "$TOOLBOX" >/dev/null 2>&1 || true
 fi
-exec toolbox run --container "$TOOLBOX" env "${VK_ENV[@]}" LD_LIBRARY_PATH="$BIN" \
+
+# NOTE: intentionally NOT `exec` — the shell must stay alive so the FREE_GPU trap restarts comfyui/OCR
+# when the server exits or is interrupted.
+toolbox run --container "$TOOLBOX" env "${VK_ENV[@]}" LD_LIBRARY_PATH="$BIN" \
   "$BIN/llama-server" -m "$MODEL" \
     --alias flashnext --host 0.0.0.0 --port "$PORT" \
     -ngl "$NGL" -c "$CTX" -ub "$UB" --flash-attn "$FA" "${OT_ARGS[@]}" --metrics \
