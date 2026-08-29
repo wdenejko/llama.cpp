@@ -6,14 +6,14 @@
 #   temp 0 + code @ ~32k:     16.1 -> 28.9 (+79%);   @ ~64k: 12.0 -> 25.8 (+115%).
 # Rule: enable MTP only for DETERMINISTIC work (code / tools / extraction) run at TEMP=0.
 # Q4_K_XL is the only quant we keep. Creative sampling = unsloth thinking-mode rec.
-# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1] [FREE_GPU=1]
+# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1] [FREE_GPU=1] [UBD=512] [KVD=q8_0] [MD=<draft.gguf>]
 #   Creative/chat (default):     ./run-flashnext.sh
 #   Fast deterministic code:     MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
 export PATH="$PATH:/usr/sbin:/sbin"
 TOOLBOX=llama-nudge-vulkan
 BIN=/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin   # rebased build WITH MTP (old build/ has NO MTP)
 MODELS=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF
-MD=/home/wdenejko/models/Qwen3.8-Flash-Next-MTP-Q8_0-GGUF/Qwen3.8-Flash-Next-MTP-Q8_0.gguf  # MTP draft head
+MD="${MD:-/home/wdenejko/models/Qwen3.8-Flash-Next-MTP-Q8_0-GGUF/Qwen3.8-Flash-Next-MTP-Q8_0.gguf}"  # MTP draft head (env-overridable)
 
 QUANT="${QUANT:-Q4_K_XL}"
 PORT="${PORT:-8080}"
@@ -65,7 +65,17 @@ VK_ENV=()
 if [ "$MTP" = "1" ]; then
   # draft-mtp ONLY. Do NOT add ngram-mod (its 48-64 tok drafts regress acceptance here).
   # p-min 0.75 gates low-confidence drafts (keeps prose from regressing).
-  MTP_ARGS=(-md "$MD" --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75)
+  UBD="${UBD:-512}"   # draft-context physical batch. The draft otherwise inherits UB and reserves a
+                      # SECOND ub x n_ctx mask/compute set; 512 shrinks it 4x so the TARGET keeps
+                      # UB=2048 prefill (+11-13% pp vs ub512 at 0-64k). Decode-side cost: none.
+  KVD="${KVD:-q8_0}"  # draft KV cache type (1 attn layer; q8_0 halves it, ~120MB at 128k)
+  # VALIDATED ENVELOPE (2026-08-29): with the default Q8 draft, ub2048+MTP prefill is proven to ~96k
+  # (dies ~129k on a HOST oom-kill: 103GB model + drafts + deep transients fill the 128GB box).
+  # For genuinely deeper jobs pick ONE: MD=<...MTP-Q4_K_M.gguf> (frees 1.35GB, full 128k proven, but
+  # shallow decode drops 44->32 t/s at 74% accept, and the box peaks at free=0) or UB=512 (pp at 128k
+  # is within 6.5% of ub2048 anyway: 141.5 vs 150.7).
+  MTP_ARGS=(-md "$MD" --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75
+            --spec-draft-ubatch "$UBD" --spec-draft-type-k "$KVD" --spec-draft-type-v "$KVD")
   # HISTORY: coopmat under MTP used to DEADLOCK the GPU — a KHR_coopmat matmul shader's Vulkan fence never
   # signalled on the small speculative batch shapes (llama_decode spun in ggml_vk_wait_for_fence, no
   # device-lost). FIXED 2026-08-29 by ordering the cross-backend event wait through its timeline semaphore
