@@ -62,6 +62,16 @@ MTP_ARGS=()
 VK_ENV=()
 # COOPMAT=0 is a global kill switch forcing KHR_coopmat OFF (regression fallback). Default is ON.
 [ "$COOPMAT" = "0" ] && VK_ENV=(GGML_VK_DISABLE_COOPMAT=1)
+# pass experiment env vars into the toolbox (toolbox run does not forward the host env)
+for _v in GGML_TOPK_LOG Q4X_QSA_BLK_TOPK GGML_VK_EVENT_DEVICE_WAIT GGML_VK_EVENT_TL_OFF; do
+  if [ -n "${!_v:-}" ]; then VK_ENV+=("$_v=${!_v}"); fi
+done
+# Q4X_RS_ROLLBACK: enable qwen4exp recurrent partial rollback (n_rs_seq=4). Without it every
+# speculative rejection restores a ~112 MiB checkpoint — and when coopmat's restore+redecode is
+# not bit-reproducible that restore loops forever (the historical "fence deadlock"/decode stall).
+# Validated 2026-08-29: 10/10 harness tasks, 0 restores, stall task 62s->7s. RSROLL=0 disables
+# (the server-side non-convergence guard then covers the livelock, at checkpoint-churn cost).
+[ "${RSROLL:-1}" != "0" ] && VK_ENV+=(Q4X_RS_ROLLBACK=1)
 if [ "$MTP" = "1" ]; then
   # draft-mtp ONLY. Do NOT add ngram-mod (its 48-64 tok drafts regress acceptance here).
   # p-min 0.75 gates low-confidence drafts (keeps prose from regressing).
@@ -150,8 +160,10 @@ fi
 
 # NOTE: intentionally NOT `exec` — the shell must stay alive so the FREE_GPU trap restarts comfyui/OCR
 # when the server exits or is interrupted.
+VERBOSE_ARGS=()
+[ "${VERBOSE:-0}" = "1" ] && VERBOSE_ARGS=(--verbose)
 toolbox run --container "$TOOLBOX" env "${VK_ENV[@]}" LD_LIBRARY_PATH="$BIN" \
-  "$BIN/llama-server" -m "$MODEL" \
+  "$BIN/llama-server" -m "$MODEL" "${VERBOSE_ARGS[@]}" \
     --alias flashnext --host 0.0.0.0 --port "$PORT" \
     -ngl "$NGL" -c "$CTX" -ub "$UB" --flash-attn "$FA" "${OT_ARGS[@]}" --metrics \
     --parallel "$PARALLEL" \
