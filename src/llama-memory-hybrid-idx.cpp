@@ -342,18 +342,25 @@ uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
+        ggml_tensor * blk_cells_dup,
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        bool blk_topk) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
+    GGML_ASSERT(!blk_topk || (blk_bias && blk_cells_dup != nullptr));
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    // the blk_topk graph never consumes cell_blk, so it is not created there (an unconsumed
+    // input is never allocated and cannot be written)
+    GGML_ASSERT(blk_topk == (cell_blk == nullptr));
 
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
+    GGML_ASSERT(ggml_backend_buffer_is_host(blk_cells->buffer));
+
+    const int64_t n_kv     = cell_blk ? cell_blk->ne[0] : get_idx()->get_n_kv();
+    const int64_t n_ns     = blk_cells->ne[1];       // streams in this ubatch
     const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
@@ -361,7 +368,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    int32_t * dst_cell_blk  = cell_blk ? (int32_t *) cell_blk->data : nullptr;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
@@ -379,20 +386,31 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     // one pass per stream: cell j is a different token in each, so no mapping is shared
     std::vector<int32_t> blk_of(n_kv);
     std::vector<int32_t> filled(n_blocks);
+    std::vector<uint8_t> slot_set;
+    std::vector<int32_t> first_cell;
+    if (blk_topk) {
+        slot_set.resize(r*n_blocks);
+        first_cell.resize(n_blocks);
+    }
 
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
+        int32_t * cur_cell_blk  = dst_cell_blk ? dst_cell_blk + s*n_kv : nullptr;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
+        int32_t * cur_dup       = blk_topk ? (int32_t *) blk_cells_dup->data + s*(r*n_blocks) : nullptr;
 
         // an incomplete block cannot be pooled; the bias below forces those tail cells in
         // -1 means no usable block, and block 0 only keeps the gather in range
         std::fill(blk_of.begin(),  blk_of.end(),  -1);
         std::fill(filled.begin(),  filled.end(),   0);
         std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+        if (blk_topk) {
+            std::fill(slot_set.begin(),   slot_set.end(),    0);
+            std::fill(first_cell.begin(), first_cell.end(), -1);
+        }
 
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false
@@ -414,17 +432,39 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             blk_of[j] = (int32_t) b;
             cur_blk_cells[b*r + (p%r)] = (int32_t) j;
             filled[b]++;
+
+            if (blk_topk) {
+                slot_set[b*r + (p%r)] = 1;
+                if (first_cell[b] < 0) {
+                    first_cell[b] = (int32_t) j;
+                }
+            }
         }
 
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
 
+        if (blk_topk) {
+            // unfilled slots repeat a filled cell of the same block, so a block->cells gather stays
+            // in range and its extra set_rows writes land on an already-selected row (idempotent).
+            // a fully empty block only gets selected in the underfull regime, where every visible
+            // cell is attended anyway, so falling back to cell 0 there is harmless
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                for (int64_t t = 0; t < r; ++t) {
+                    cur_dup[b*r + t] = slot_set[b*r + t] ? cur_blk_cells[b*r + t]
+                                     : (first_cell[b] >= 0 ? first_cell[b] : 0);
+                }
+            }
+        }
+
         // per-block mode keeps an unpooled cell's real block, so the block's own -inf reaches it
         // per-cell mode carries that -inf itself and only needs the gather in range
-        for (int64_t j = 0; j < n_kv; ++j) {
-            if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
-                blk_of[j] = -1;
+        if (cur_cell_blk != nullptr) {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (blk_of[j] >= 0 && filled[blk_of[j]] < r && !blk_bias) {
+                    blk_of[j] = -1;
+                }
+                cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
             }
-            cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -440,9 +480,20 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 // the caller adds the attention mask, which drops empty, foreign and future cells
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
-                for (int64_t b = 0; b < n_blocks; ++b) {
-                    // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = b*r >= tail_start ? 1e9f : (filled[b] < r ? -INFINITY : 0.0f);
+                if (blk_topk) {
+                    // a block-level top-k selects on this bias alone -- no per-cell mask add cleans
+                    // up afterwards -- so the bias must carry visibility itself: force the one tail
+                    // block (it contains q), and drop strictly-future and incomplete blocks
+                    for (int64_t b = 0; b < n_blocks; ++b) {
+                        // finite, so it can never meet a -inf and produce a nan
+                        cur_blk_bias[b] = b*r >= tail_start ? (b*r <= q ? 1e9f : -INFINITY)
+                                        : (filled[b] < r ? -INFINITY : 0.0f);
+                    }
+                } else {
+                    for (int64_t b = 0; b < n_blocks; ++b) {
+                        // finite, so it can never meet a -inf and produce a nan
+                        cur_blk_bias[b] = b*r >= tail_start ? 1e9f : (filled[b] < r ? -INFINITY : 0.0f);
+                    }
                 }
 
                 continue;

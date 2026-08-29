@@ -627,13 +627,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool blk_topk) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), blk_topk(blk_topk) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        mctx->set_input_qsa(cell_blk, blk_cells, blk_cells_dup, blk_pos, bias, ubatch, ratio, blk_bias, blk_topk);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -653,28 +653,44 @@ public:
         res &= params.ubatch.n_tokens % n_stream == 0;
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
-        res &= cell_blk->ne[0]  == n_kv;
-        res &= cell_blk->ne[1]  == n_stream;
         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
+        res &= blk_cells->ne[1] == n_stream;
         res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
         res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+
+        if (blk_topk) {
+            // no cell_blk to carry the exact n_kv (blk_cells only pins ceil(n_kv/r)), and the
+            // k_all view is sized by the build-time n_kv, so require an exact match
+            res &= n_kv_build == n_kv;
+            res &= blk_cells_dup != nullptr && blk_cells_dup->ne[0] == (int64_t) ratio*n_blocks;
+        } else {
+            res &= cell_blk->ne[0] == n_kv;
+            res &= cell_blk->ne[1] == n_stream;
+        }
 
         return res;
     }
 
     // per stream: a cell index names a different token in each stream
-    ggml_tensor * k_idxs    = nullptr;   // I32 [n_tokens]
-    ggml_tensor * cell_blk  = nullptr;   // I32 [n_kv, n_stream]
-    ggml_tensor * blk_cells = nullptr;   // I32 [ratio*n_blocks, n_stream]
-    ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
-    ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
+    ggml_tensor * k_idxs        = nullptr;   // I32 [n_tokens]
+    ggml_tensor * cell_blk      = nullptr;   // I32 [n_kv, n_stream]; null under blk_topk (unused there)
+    ggml_tensor * blk_cells     = nullptr;   // I32 [ratio*n_blocks, n_stream]
+    ggml_tensor * blk_cells_dup = nullptr;   // I32 [ratio*n_blocks, n_stream], unfilled slots repeat a filled cell
+    ggml_tensor * blk_pos       = nullptr;   // I32 [4*n_blocks*n_stream]
+    ggml_tensor * bias          = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
+
+    // select whole blocks from the per-block scores (never expanding to per-cell scores); needs blk_bias
+    const bool blk_topk;
+
+    // n_kv the graph was built for; can_reuse needs it when cell_blk is absent (blk_topk)
+    int64_t n_kv_build = 0;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -708,6 +724,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
         cparams.causal_attn && !hparams.use_alibi;
 
+    // block-level top-k: select whole blocks from the [n_blocks] scores instead of expanding to the
+    // [n_kv, n_tps] per-cell scores -- that expansion (plus the f32 mask cast) is the ubatch-scaled
+    // prefill memory hog at deep context. Needs the per-block bias to carry visibility on its own.
+    static const bool blk_topk_env = getenv("Q4X_QSA_BLK_TOPK") != nullptr;
+    const bool blk_topk = blk_topk_env && blk_bias;
+
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
 
@@ -715,18 +737,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, blk_topk);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
         qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
-        ggml_set_input(qsa->cell_blk);
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
         ggml_set_input(qsa->bias);
+
+        // cell_blk only feeds the per-cell score expansion; the blk_topk path returns before it,
+        // so creating it there leaves an unconsumed input the scheduler never allocates
+        // (set_input would then write through a null buffer)
+        if (blk_topk) {
+            qsa->blk_cells_dup = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
+            ggml_set_input(qsa->blk_cells_dup);
+        } else {
+            qsa->cell_blk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+            ggml_set_input(qsa->cell_blk);
+        }
+
+        qsa->n_kv_build = n_kv;
 
         inp = qsa.get();
         res->add_input(std::move(qsa));
@@ -790,6 +823,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // one value per block, so it is cheaper to bias here than after the cells are expanded
     if (blk_bias) {
         score = ggml_add(ctx0, score, inp->bias);
+    }
+
+    if (inp->blk_topk) {
+        // select whole blocks straight from the per-block scores. The blk_topk bias variant
+        // carries visibility on its own (tail forced in; strictly-future and incomplete blocks
+        // -inf), and build_attn_qsa re-applies the causal KQ mask after unmasking, so the tail
+        // overshoot and any -inf block picked in the underfull regime are re-masked. This skips
+        // the [n_kv, n_tps] expanded scores, the f32 mask cast and the n_kv-wide sort.
+        const int64_t width_blk = std::min<int64_t>(n_blocks,
+                ((int64_t) hparams.indexer_top_k + r - 1 + r - 1)/r);
+
+        ggml_tensor * top_blk = ggml_cont(ctx0, ggml_top_k(ctx0, score, width_blk));
+        cb(top_blk, "indexer_top_blk", il);
+
+        // expand block ids to their member cells; blk_cells_dup repeats a filled cell into a
+        // block's unfilled slots so the extra set_rows writes are idempotent
+        ggml_tensor * blk2cell = ggml_reshape_3d(ctx0, inp->blk_cells_dup, r, n_blocks, n_stream);
+        ggml_tensor * blk_idx  = ggml_reshape_2d(ctx0, top_blk, width_blk*n_tps, n_stream);
+
+        ggml_tensor * top_k = ggml_get_rows(ctx0, blk2cell, blk_idx);
+
+        // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
+        top_k = ggml_reshape_4d(ctx0, top_k, r*width_blk, n_tps, 1, n_stream);
+        cb(top_k, "indexer_top_k", il);
+
+        return top_k;
     }
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
