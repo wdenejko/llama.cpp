@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 
+#include <cstdlib>
 #include <map>
 #include <vector>
 
@@ -1107,6 +1108,13 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_BAILINGMOE3:
             return true;
+        case LLM_ARCH_QWEN4EXP:
+            // qwen4exp builds its recurrent state through the same build_rs machinery as QWEN35
+            // (qwen4exp.cpp:1086 vs qwen35.cpp:391), so partial rollback should hold; without it
+            // n_rs_seq clamps to 0 and EVERY speculative rejection takes the checkpoint-restore
+            // path (a ~112 MiB memcpy per draft round, and a livelock when the restore+redecode
+            // is not numerically reproducible). Env-gated until validated on this arch.
+            return getenv("Q4X_RS_ROLLBACK") != nullptr;
         default:
             return false;
     }

@@ -263,6 +263,12 @@ struct server_slot {
     // checkpoint position so we can cap the replay and force progress.
     llama_pos spec_guard_pos   = -1;
     int       spec_guard_count = 0;
+
+    // set when the guard detects a non-converging replay (restore+redecode is not numerically
+    // reproducible, so the replayed draft keeps getting re-rejected): skip drafting for one step
+    // and decode a single plain token instead, which banks the target's own sample and guarantees
+    // forward progress under ANY numerics
+    bool spec_suspend_once = false;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -379,6 +385,7 @@ struct server_slot {
         spec_is_replay = false;
         spec_guard_pos   = -1;
         spec_guard_count = 0;
+        spec_suspend_once = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -2985,7 +2992,10 @@ private:
 
                 const int n_draft_max = slot.get_n_draft_max();
 
-                if (n_draft_max > 0) {
+                if (n_draft_max > 0 && slot.spec_suspend_once) {
+                    // the livelock guard asked for one plain decode step to force progress
+                    slot.spec_suspend_once = false;
+                } else if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
                     if (!slot.spec_draft.empty()) {
@@ -3937,6 +3947,20 @@ private:
                                 if (slot.spec_draft.size() > cap) {
                                     slot.spec_draft.resize(cap);
                                 }
+                            }
+                            if (slot.spec_guard_count >= 3) {
+                                // The replay is not converging: restore+redecode is numerically
+                                // non-reproducible (observed with coopmat at wide ubatch), so the
+                                // replayed correction keeps getting re-rejected and re-restored at
+                                // this same position forever (n_rs_seq = 0 makes every rejection
+                                // take this path). Force progress: drop the replay draft and decode
+                                // one plain token next step -- that banks the target's own sample
+                                // from the current state, which is exact under any numerics.
+                                SLT_WRN(slot, "speculative replay not converging at pos %d (%d restores) -> forcing one plain decode step\n",
+                                        (int) ckpt.pos_max, slot.spec_guard_count);
+                                slot.spec_draft.clear();
+                                slot.spec_is_replay    = false;
+                                slot.spec_suspend_once = true;
                             }
                         } else {
                             slot.spec_guard_pos   = ckpt.pos_max;
