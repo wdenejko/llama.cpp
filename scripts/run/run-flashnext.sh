@@ -30,8 +30,8 @@ PARALLEL="${PARALLEL:-1}"            # 1 = single stream = fastest PER REQUEST; 
 UB="${UB:-2048}"                     # physical batch. MEASURED pp4096 on this box: 512->2048 is +25% coopmat-OFF
                                      # (386->484) and +14% coopmat-ON (494->564); plateaus by 3072. ub2048 verified
                                      # NON-OOM at full 131072 ctx (peak 87GB / 121GB free). Was 512.
-COOPMAT="${COOPMAT:-1}"              # KHR_coopmat matmul. 1 = ON (default): recovers prefill (~+16% shallow,
-                                     # ~+40% @128k), and is safe under MTP since the event fix (81aa39c17).
+COOPMAT="${COOPMAT:-1}"              # KHR_coopmat matmul. 1 = ON (default): recovers prefill (measured ub2048:
+                                     # +16% at d0, +11% @32k — shrinks with depth), safe under MTP since 81aa39c17.
                                      # 0 = force OFF (GGML_VK_DISABLE_COOPMAT=1) as a regression fallback.
 FREE_GPU="${FREE_GPU:-1}"            # 1 = stop comfyui/OCR + wait for GTT/RAM headroom before the ~103GB
                                      # load, and restart them when the server exits. 0 = leave services be.
