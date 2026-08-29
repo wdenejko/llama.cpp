@@ -6,7 +6,7 @@
 #   temp 0 + code @ ~32k:     16.1 -> 28.9 (+79%);   @ ~64k: 12.0 -> 25.8 (+115%).
 # Rule: enable MTP only for DETERMINISTIC work (code / tools / extraction) run at TEMP=0.
 # Q4_K_XL is the only quant we keep. Creative sampling = unsloth thinking-mode rec.
-# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1]
+# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048]
 #   Creative/chat (default):     ./run-flashnext.sh
 #   Fast deterministic code:     MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
 export PATH="$PATH:/usr/sbin:/sbin"
@@ -27,6 +27,9 @@ REASONING="${REASONING:-medium}"     # xhigh|medium|low = think ON at that effor
 TEMP="${TEMP:-1.0}"                  # 1.0 = creative default; set 0 for deterministic work (REQUIRED for MTP to help)
 MTP="${MTP:-0}"                      # 0 = plain base decode (right for temp 1.0); 1 = MTP (only useful at TEMP=0)
 PARALLEL="${PARALLEL:-1}"            # 1 = single stream = fastest PER REQUEST; higher = concurrency but dilutes each
+UB="${UB:-2048}"                     # physical batch. MEASURED pp4096 on this box: 512->2048 is +25% coopmat-OFF
+                                     # (386->484) and +14% coopmat-ON (494->564); plateaus by 3072. ub2048 verified
+                                     # NON-OOM at full 131072 ctx (peak 87GB / 121GB free). Was 512.
 
 case "$QUANT" in
   Q4_K_XL) MODEL="$MODELS/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf" ;;
@@ -73,7 +76,7 @@ podman start "$TOOLBOX" >/dev/null 2>&1 || true
 exec toolbox run --container "$TOOLBOX" env "${VK_ENV[@]}" LD_LIBRARY_PATH="$BIN" \
   "$BIN/llama-server" -m "$MODEL" \
     --alias flashnext --host 0.0.0.0 --port "$PORT" \
-    -ngl "$NGL" -c "$CTX" -ub 512 --flash-attn "$FA" "${OT_ARGS[@]}" --metrics \
+    -ngl "$NGL" -c "$CTX" -ub "$UB" --flash-attn "$FA" "${OT_ARGS[@]}" --metrics \
     --parallel "$PARALLEL" \
     --temp "$TEMP" --top-p 0.95 --top-k 20 --min-p 0.0 \
     --presence-penalty 0.0 --repeat-penalty 1.0 \
