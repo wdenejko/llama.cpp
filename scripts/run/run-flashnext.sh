@@ -69,15 +69,15 @@ VK_ENV=()
 for _v in GGML_TOPK_LOG GGML_VK_EVENT_DEVICE_WAIT GGML_VK_EVENT_TL_OFF Q4X_SPEC_STOCH_TOPK Q4X_SPEC_STOCH_TEMP; do
   if [ -n "${!_v:-}" ]; then VK_ENV+=("$_v=${!_v}"); fi
 done
-# Q4X_RS_ROLLBACK: qwen4exp recurrent partial rollback (n_rs_seq=4). DEFAULT OFF — measured
-# 2026-08-30: partial rollback CORRUPTS the recurrent state on every speculative rejection
-# (the graph does not write the per-token snapshot planes the rollback ring restores from).
-# Invisible at temp 0 (few rejections, argmax robust); at temp>0 output degrades into gibberish
-# within ~50 tokens and draft acceptance collapses (8% vs 64% on the same probe). The
-# checkpoint-restore path is the exact one; its livelock risk is covered by the server-side
-# non-convergence guard (forces one plain decode step after 3 same-pos restores). RSROLL=1
-# re-enables rollback only for experiments until the snapshot writing is actually implemented.
-[ "${RSROLL:-0}" = "1" ] && VK_ENV+=(Q4X_RS_ROLLBACK=1)
+# Q4X_RS_ROLLBACK: qwen4exp recurrent partial rollback (n_rs_seq=4). DEFAULT ON since the
+# conv snapshot-plane fix (2026-08-30): build_conv_state_at now fills planes 1..n_rs_seq of
+# both conv rows (delta-net + PLE) like the shared helper; the ssm planes already came from
+# the fused GDN op's K snapshots. Validated at the corruption repro (temp 1 + reasoning):
+# accept 86/78/70% == the checkpoint-path reference, coherent 1100-token gens, and
+# +19% decode (37.9 vs 31.9 t/s mean) from skipping the 112 MiB checkpoint restore per
+# rejection; temp-0 harness 10/10, 0 restores. RSROLL=0 falls back to checkpoint-restore
+# (exact but slower; its livelock risk is covered by the server-side guard either way).
+[ "${RSROLL:-1}" != "0" ] && VK_ENV+=(Q4X_RS_ROLLBACK=1)
 # Q4X_QSA_BLK_TOPK: block-level QSA indexer top-k. A/B 2026-08-30 (symmetric, 98k ctx): pp +25%
 # and tg +11% at 32-64k depth, pp +5% shallow, ~2GB less GTT at full ctx, needle retrieval
 # intact at 32k/64k, harness 10/10 — and the k=2051 CPU top_k fallback disappears (~14k

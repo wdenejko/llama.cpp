@@ -1345,17 +1345,35 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     // keep the last state_cols columns for the next ubatch
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
 
-    ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-            state_cols, channels, n_seqs,
-            conv_input->nb[1], conv_input->nb[2],
-            ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
+    const int64_t mem_size = mctx_cur->get_size();
 
-    ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-            state_cols * channels, n_seqs,
-            conv_states_all->nb[1],
-            kv_head * row_size);
+    // with rollback enabled, also fill the per-token snapshot planes: the conv state
+    // "s tokens back" is just the window ending s tokens earlier, so each plane is a
+    // shifted view of conv_input (mirrors the shared build_conv_state K-loop). This was
+    // the missing half of qwen4exp rollback support: the ssm snapshots already come from
+    // the fused GDN op through the shared build_recurrent_attn, but planes 1..n_rs_seq of
+    // BOTH conv rows (delta-net r_l and PLE p_l) were never written, so a rollback read
+    // them stale and generation degraded a little more on every speculative rejection.
+    // K == 1 (rollback off) degenerates to the single plane-0 write this replaced.
+    // [TAG_RECURRENT_ROLLBACK_SPLITS] the last K tokens of a seq share one ubatch.
+    const int64_t K = cparams.n_rs_seq > 0 ? (int64_t) cparams.n_rs_seq + 1 : 1;
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+    for (int64_t t = 1; t <= K; ++t) {
+        const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - state_cols - K + t);
+        const int64_t s_slot = K - t;
+
+        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, s_idx));
+
+        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols * channels, n_seqs,
+                conv_states_all->nb[1],
+                ((size_t) s_slot * mem_size + kv_head) * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+    }
 
     return conv_input;
 }

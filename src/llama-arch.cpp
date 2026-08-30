@@ -1109,13 +1109,14 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_BAILINGMOE3:
             return true;
         case LLM_ARCH_QWEN4EXP:
-            // MEASURED 2026-08-30: partial rollback on this arch is LOSSY — the graph does not
-            // write the per-token rollback snapshot planes, so every restore lands on stale
-            // state and generation degrades progressively (violent at temp>0: gibberish within
-            // ~50 tokens, draft acceptance 64%->8% on the same probe). Env gate kept for
-            // experiments only; do NOT enable by default until the snapshot writes exist for
-            // this graph. Without it, rejections take the (exact) checkpoint-restore path and
-            // the server's replay non-convergence guard covers the livelock risk.
+            // Correct since the conv snapshot-plane fix (build_conv_state_at K-loop): the ssm
+            // planes come from the fused GDN op's K snapshots via the shared
+            // build_recurrent_attn, and both conv rows (delta-net r_l + PLE p_l) now fill
+            // planes 1..n_rs_seq like the shared build_conv_state. Validated at the former
+            // corruption repro (temp 1 + reasoning): acceptance matches the checkpoint-path
+            // reference (86/78/70%) with coherent long generations, +19% decode from skipping
+            // the per-rejection checkpoint restore. Env-gated so the launcher's RSROLL=0 kill
+            // switch can force the (exact, slower) checkpoint-restore path.
             return getenv("Q4X_RS_ROLLBACK") != nullptr;
         default:
             return false;
