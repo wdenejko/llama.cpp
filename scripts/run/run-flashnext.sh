@@ -105,10 +105,17 @@ if [ "$MTP" = "1" ]; then
   # is within 6.5% of ub2048 anyway: 141.5 vs 150.7).
   PMIN="${PMIN:-0.75}"  # draft confidence gate; tuned for greedy drafting — with SPEC_STOCH at
                         # temp>0 the draft's max-prob is flatter, so a lower PMIN drafts deeper
-  NMAX="${NMAX:-6}"     # draft depth. A/B 2026-08-30 (temp 0, 98k ctx): 6 beats 4 by +4-7% tg at
-                        # 0/32k/64k (42.1/34.4/40.0 vs 39.3/32.9/38.0) - the accept drop (88->80%)
-                        # loses to the longer drafts. NB the Vulkan mat-vec shaders batch at most
-                        # 8 columns, so keep NMAX+1 <= 8 or every verify matmul falls off a ~2.7x cliff
+  # draft depth, temperature-conditional default (A/B'd 2026-08-30 both ways):
+  #   temp 0 (greedy): 6 beats 4 by +4-7% tg at 0/32k/64k (42.1/34.4/40.0 vs 39.3/32.9/38.0);
+  #     the accept drop (88->80%) loses to the longer drafts.
+  #   temp>0 (stochastic spec): 4 beats 6 by +2.4% mean / +6% on code (33.73 vs 32.93; accept
+  #     81->68% on code) - sampled drafts diverge at depth 5-6 and rejections discard more.
+  # NB the Vulkan mat-vec shaders batch at most 8 columns, so keep NMAX+1 <= 8 or every
+  # verify matmul falls off a ~2.7x cliff.
+  case "$TEMP" in
+    0|0.0) NMAX="${NMAX:-6}" ;;
+    *)     NMAX="${NMAX:-4}" ;;
+  esac
                         # (apepojken fork measurement); 6 was their sweet spot at ~0.9 accept
   MTP_ARGS=(-md "$MD" --spec-type draft-mtp --spec-draft-n-max "$NMAX" --spec-draft-p-min "$PMIN"
             --spec-draft-ubatch "$UBD" --spec-draft-type-k "$KVD" --spec-draft-type-v "$KVD")
