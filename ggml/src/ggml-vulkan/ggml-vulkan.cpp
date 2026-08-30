@@ -1456,6 +1456,9 @@ struct vk_op_mmid_row_lists_push_constants {
     uint32_t nb01;
     uint32_t a_offset;
     uint32_t n_as;
+    // [MMID_COMPACT] bn != 0 also emits the live-tile list (see mmid_row_lists.comp)
+    uint32_t bn;
+    uint32_t bound_tiles;
 };
 
 struct vk_op_glu_push_constants {
