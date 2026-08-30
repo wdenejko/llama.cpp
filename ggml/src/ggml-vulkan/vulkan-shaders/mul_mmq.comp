@@ -163,7 +163,8 @@ void main() {
 
 #ifdef MUL_MAT_ID
     if (p.use_row_lists != 0) {
-        load_row_ids_from_lists(expert_idx, ic);
+        // mmq always uses the z-slice-per-expert grid (MMID_COMPACT is gated off for it)
+        load_row_ids_from_lists(gl_NumWorkGroups.z, expert_idx, ic);
     } else {
 #ifdef MUL_MAT_ID_USE_SUBGROUPS
     if (bitCount(p.nei0) == 1) {
