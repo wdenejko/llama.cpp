@@ -105,6 +105,11 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint padded_N;
+    // [MM_TILE_EPILOG] 0x1 = sigmoid, 0x2 = silu; scales apply before/after
+    uint fusion_flags;
+    float fuse_scale_pre;
+    float fuse_scale_post;
 #endif
 } p;
 
@@ -445,6 +450,35 @@ void main() {
         sums[i].y = clamp(sums[i].y, -ACC_TYPE_MAX, ACC_TYPE_MAX);
     }
 #endif
+#endif
+
+#ifndef MUL_MAT_ID
+    // [MM_TILE_EPILOG] fused [scale] sigmoid|silu [scale], computed in f32 on the
+    // accumulators. split_k never runs with fusion, so the sums are complete here.
+    if (p.fusion_flags != 0u) {
+#ifdef COOPMAT
+        [[unroll]] for (uint j = 0; j < cms_per_row * cms_per_col; j++) {
+            [[unroll]] for (uint i = 0; i < sums[j].length(); ++i) {
+                float fv = float(sums[j][i]) * p.fuse_scale_pre;
+                const float sig = 1.0f / (1.0f + exp(-fv));
+                fv = ((p.fusion_flags & 2u) != 0u) ? fv * sig : sig;
+                sums[j][i] = ACC_TYPE(fv * p.fuse_scale_post);
+            }
+        }
+#else
+        [[unroll]] for (uint i = 0; i < WMITER*TM*WNITER*TN/2; i++) {
+            float fx = float(sums[i].x) * p.fuse_scale_pre;
+            float fy = float(sums[i].y) * p.fuse_scale_pre;
+            const float sx = 1.0f / (1.0f + exp(-fx));
+            const float sy = 1.0f / (1.0f + exp(-fy));
+            const bool is_silu = (p.fusion_flags & 2u) != 0u;
+            fx = is_silu ? fx * sx : sx;
+            fy = is_silu ? fy * sy : sy;
+            sums[i].x = ACC_TYPE(fx * p.fuse_scale_post);
+            sums[i].y = ACC_TYPE(fy * p.fuse_scale_post);
+        }
+#endif
+    }
 #endif
 
     const uint dr = ir * BM + warp_r * WM;

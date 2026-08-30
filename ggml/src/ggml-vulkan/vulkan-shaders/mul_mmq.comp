@@ -69,6 +69,11 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint padded_N;
+    // [MM_TILE_EPILOG] 0x1 = sigmoid, 0x2 = silu; scales apply before/after
+    uint fusion_flags;
+    float fuse_scale_pre;
+    float fuse_scale_post;
 #endif
 } p;
 
@@ -314,7 +319,15 @@ void main() {
                     }
 #else
                     if (dr_warp + cr < p.M && dc_warp + cc < p.N) {
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + cr] = D_TYPE(sums[sums_idx].x);
+                        float fv = float(sums[sums_idx].x);
+                        // [MM_TILE_EPILOG] fused [scale] sigmoid|silu [scale]
+                        if (p.fusion_flags != 0u) {
+                            fv *= p.fuse_scale_pre;
+                            const float sig = 1.0f / (1.0f + exp(-fv));
+                            fv = ((p.fusion_flags & 2u) != 0u) ? fv * sig : sig;
+                            fv *= p.fuse_scale_post;
+                        }
+                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + cr] = D_TYPE(fv);
                     }
 #endif // MUL_MAT_ID
                 }

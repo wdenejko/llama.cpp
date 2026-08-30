@@ -1298,7 +1298,15 @@ struct vk_mat_mat_push_constants {
     uint32_t k_split;
     uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
     uint32_t padded_N;
+    // [MM_TILE_EPILOG] fused [scale] sigmoid|silu [scale] applied on the
+    // accumulators before the store (tile route only, split_k must be 1)
+    uint32_t fusion_flags;
+    float fuse_scale_pre;
+    float fuse_scale_post;
 };
+
+#define MM_TILE_FUSION_SIGMOID 0x1
+#define MM_TILE_FUSION_SILU    0x2
 
 #define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
@@ -2567,6 +2575,14 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    // [MM_TILE_EPILOG] pending fused epilog for the next dense tile matmul,
+    // set by ggml_vk_mul_mat and consumed by ggml_vk_mul_mat_q_f16. prec is the
+    // MUL_MAT node's op_params[0]: dst is swapped for the chain's final node,
+    // whose op_params mean something else entirely
+    uint32_t fused_mm_tile_flags {};
+    float fused_mm_tile_scale_pre {1.0f};
+    float fused_mm_tile_scale_post {1.0f};
+    int32_t fused_mm_tile_prec {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -4579,6 +4595,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
 
+            // EXPERIMENT (GGML_VK_DENSE_BM256=1): 256-tall dense large tile. The HC
+            // low-rank pair (m=320 k=10240 n=2048) re-streams its 40MB B matrix once
+            // per M-tile; BM 128->256 cuts that from 3 passes to 2. Warp grids keep
+            // 8 warps: f16 WM=64 WN=64 (4x2), int WM=64 WN=64. Applies to every big
+            // dense GEMM, which is exactly what the A/B must price in.
+            {
+                static const char * bm256_env = getenv("GGML_VK_DENSE_BM256");
+                if (bm256_env && atoi(bm256_env) != 0) {
+                    l_warptile           = { 256, 256, 128, 16, 64, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+                    l_warptile_mmq       = { 256, 256, 128, 32, 64, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
+                    l_warptile_mmq_int   = { 256, 256, 128, 32, 64, 64, 2, 4, 4, 1, subgroup_size_8 };
+                    l_warptile_mmq_int_k = { 256, 256, 128, 32, 64, 64, 1, 4, 2, 1, subgroup_size_16 };
+                    // NB the matching wg_denoms override lives after the global
+                    // denoms assignment below, which would clobber it here
+                }
+            }
+
             // EXPERIMENT (GGML_VK_MMID_WG256=1): the dense large tile above runs 256 threads on a
             // 128x128 tile, but the mul_mat_id variants still run 128. Give MoE the same thread
             // count per tile: same BM/BN/BK (so same shared memory), twice the threads sharing each
@@ -4604,6 +4637,21 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
         m_mmq_wg_denoms = m_wg_denoms = { 64,  64, 1 };
         s_mmq_wg_denoms = s_wg_denoms = { 32,  32, 1 };
+        {
+            // [GGML_VK_DENSE_BM256] second half of the experiment above: the taller
+            // large-tile warptiles need matching dispatch denominators
+            static const char * bm256_env2 = getenv("GGML_VK_DENSE_BM256");
+            if (bm256_env2 && atoi(bm256_env2) != 0 &&
+                device->vendor_id == VK_VENDOR_ID_AMD && device->coopmat_support &&
+                device->driver_id != vk::DriverId::eAmdProprietary) {
+                l_mmq_wg_denoms = l_wg_denoms = { 256, 128, 1 };
+                static bool bm256_logged = false;
+                if (!bm256_logged) {
+                    bm256_logged = true;
+                    fprintf(stderr, "ggml_vulkan: dense large tile BM=256 (GGML_VK_DENSE_BM256)\n");
+                }
+            }
+        }
         l_align = 128;
         m_align =  64;
         s_align =  32;
@@ -9546,7 +9594,7 @@ static void ggml_vk_matmul(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t split_k, uint32_t batch, uint32_t ne02, uint32_t ne12, uint32_t broadcast2, uint32_t broadcast3,
-        uint32_t padded_n) {
+        uint32_t padded_n, uint32_t fusion_flags = 0, float fuse_scale_pre = 1.0f, float fuse_scale_post = 1.0f) {
         VK_LOG_DEBUG("ggml_vk_matmul(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
     if (split_k == 1) {
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
@@ -9555,7 +9603,7 @@ static void ggml_vk_matmul(
         while (base_work_group_z < batch) {
             uint32_t groups_z = std::min(batch - base_work_group_z, ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
 
-            const vk_mat_mat_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k, ne02, ne12, broadcast2, broadcast3, padded_n };
+            const vk_mat_mat_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k, ne02, ne12, broadcast2, broadcast3, padded_n, fusion_flags, fuse_scale_pre, fuse_scale_post };
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, { m, n, groups_z });
             base_work_group_z += groups_z;
         }
@@ -9578,7 +9626,8 @@ static void ggml_vk_matmul(
     while (base_work_group_z < batch) {
         uint32_t groups_z = std::min(batch - base_work_group_z, ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
 
-        const vk_mat_mat_push_constants pc1 = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k_split, ne02, ne12, broadcast2, broadcast3, padded_n };
+        GGML_ASSERT(fusion_flags == 0 && "fused mm tile epilog requires split_k == 1");
+        const vk_mat_mat_push_constants pc1 = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k_split, ne02, ne12, broadcast2, broadcast3, padded_n, 0, 1.0f, 1.0f };
         // Make sure enough workgroups get assigned for split k to work
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, split_k_buffer }, pc1, { (CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0]) * split_k, n, groups_z });
         base_work_group_z += groups_z;
@@ -9975,12 +10024,18 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
+    // [MM_TILE_EPILOG] when the fused epilog is pending, dst is the chain's final
+    // node and its op_params are not a precision - use the MUL_MAT node's, stashed
+    // by ggml_vk_mul_mat
+    const ggml_prec mm_prec = ctx->fused_mm_tile_flags != 0 ? (ggml_prec)ctx->fused_mm_tile_prec
+                                                            : (ggml_prec)dst->op_params[0];
+
     // Check for mmq first
-    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
+    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, mm_prec) : nullptr;
 
     if (mmp == nullptr) {
         // Fall back to f16 dequant mul mat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, mm_prec);
         quantize_y = false;
     }
 
@@ -9989,7 +10044,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     if (qx_needs_dequant) {
         // Fall back to dequant + f16 mulmat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, (ggml_prec)dst->op_params[0]);
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, f16_type, y_f32_kernel ? GGML_TYPE_F32 : f16_type, mm_prec);
     }
 
     // Not implemented
@@ -10013,7 +10068,16 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
 
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
+    // [MM_TILE_EPILOG] consume a pending fused epilog set by ggml_vk_mul_mat;
+    // it rules out split_k (partial sums must not run through the epilog)
+    const uint32_t mm_fusion_flags    = ctx->fused_mm_tile_flags;
+    const float    mm_fuse_scale_pre  = ctx->fused_mm_tile_scale_pre;
+    const float    mm_fuse_scale_post = ctx->fused_mm_tile_scale_post;
+    ctx->fused_mm_tile_flags = 0;
+    ctx->fused_mm_tile_scale_pre = 1.0f;
+    ctx->fused_mm_tile_scale_post = 1.0f;
+
+    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || mm_fusion_flags != 0, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
@@ -10174,7 +10238,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
         ne01, ne11, ne10,
         ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
-        split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
+        split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
+        mm_fusion_flags, mm_fuse_scale_pre, mm_fuse_scale_post
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -10854,6 +10919,39 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
     } else {
+        // [MM_TILE_EPILOG] a fused tail on the tile route can only be the
+        // [scale] sigmoid|silu [scale] chain validated by
+        // ggml_vk_can_fuse_mm_tile_epilog (all other MUL_MAT fusions are
+        // mat-vec-gated). Fold it into flags and write the final node instead.
+        if (ctx->num_additional_fused_ops > 0) {
+            uint32_t flags = 0;
+            float scale_pre = 1.0f, scale_post = 1.0f;
+            bool unary_seen = false;
+            for (int k = 1; k <= ctx->num_additional_fused_ops; ++k) {
+                const ggml_tensor * n = cgraph->nodes[node_idx + k];
+                if (n->op == GGML_OP_SCALE) {
+                    (unary_seen ? scale_post : scale_pre) = ggml_get_op_params_f32(n, 0);
+                } else {
+                    GGML_ASSERT(n->op == GGML_OP_UNARY);
+                    flags = ggml_get_unary_op(n) == GGML_UNARY_OP_SIGMOID ? MM_TILE_FUSION_SIGMOID
+                                                                          : MM_TILE_FUSION_SILU;
+                    unary_seen = true;
+                }
+            }
+            GGML_ASSERT(unary_seen);
+            ctx->fused_mm_tile_flags = flags;
+            ctx->fused_mm_tile_scale_pre = scale_pre;
+            ctx->fused_mm_tile_scale_post = scale_post;
+            ctx->fused_mm_tile_prec = dst->op_params[0];
+            dst = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+            static bool epilog_logged = false;
+            if (!epilog_logged) {
+                epilog_logged = true;
+                fprintf(stderr, "ggml_vulkan: mm tile epilog fusion engaged (first: %s m=%lld n=%lld)\n",
+                        flags == MM_TILE_FUSION_SIGMOID ? "sigmoid" : "silu",
+                        (long long) src0->ne[1], (long long) dst->ne[1]);
+            }
+        }
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
     }
 }
@@ -18617,6 +18715,91 @@ static bool ggml_vk_can_fuse_mmv_epilog(const ggml_backend_vk_context * ctx, con
     return ggml_can_fuse(cgraph, node_idx, ops, num_extra + 1);
 }
 
+// [MM_TILE_EPILOG] fuse [SCALE] SIGMOID|SILU [SCALE] into the dense TILE matmul
+// store (the mmv epilog above only covers mat-vec). The epilog is applied on the
+// accumulators, so it needs no extra bindings; MUL-by-tensor is not handled here.
+// Gated to the general mul_mm/mul_mmq route: wide N (no mat-vec/p021/nc), no
+// M-splitting, no fwht; split_k is forced off at dispatch when the fusion fires.
+static bool ggml_vk_can_fuse_mm_tile_epilog(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
+                                            int node_idx, int num_extra) {
+    static const char * env = getenv("GGML_VK_MM_TILE_EPILOG");
+    if (!(env && atoi(env) != 0)) {
+        return false;
+    }
+    // the coopmat2 matmul shader doesn't read the epilog push constants
+    if (ctx->device->coopmat2) {
+        return false;
+    }
+    GGML_ASSERT(num_extra >= 1 && num_extra <= 3);
+    if (node_idx + num_extra >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    if (mm->op != GGML_OP_MUL_MAT || mm->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    // stay clear of every mat-vec/p021/nc threshold: wide-N prefill shapes only
+    if (mm->ne[1] < 64) {
+        return false;
+    }
+    if (!(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
+        return false;
+    }
+    // the huge-A M-splitting path dispatches several partial matmuls
+    if (mm->ne[2] == 1 && mm->ne[3] == 1 && ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+    if (ggml_vk_can_use_fwht(ctx, src1, mm)) {
+        return false;
+    }
+
+    enum ggml_op ops[4];
+    ops[0] = GGML_OP_MUL_MAT;
+
+    bool scale_pre  = false;
+    bool scale_post = false;
+    bool unary_seen = false;
+    for (int k = 1; k <= num_extra; ++k) {
+        const ggml_tensor * n = cgraph->nodes[node_idx + k];
+        ops[k] = n->op;
+        switch (n->op) {
+        case GGML_OP_SCALE:
+            if (unary_seen ? scale_post : scale_pre) {
+                return false;
+            }
+            // scale with bias isn't handled
+            if (ggml_get_op_params_f32(n, 1) != 0.0f) {
+                return false;
+            }
+            (unary_seen ? scale_post : scale_pre) = true;
+            break;
+        case GGML_OP_UNARY:
+            if (unary_seen) {
+                return false;
+            }
+            if (ggml_get_unary_op(n) != GGML_UNARY_OP_SILU &&
+                ggml_get_unary_op(n) != GGML_UNARY_OP_SIGMOID) {
+                return false;
+            }
+            unary_seen = true;
+            break;
+        default:
+            return false;
+        }
+        if (n->type != GGML_TYPE_F32 || !ggml_are_same_shape(n, mm)) {
+            return false;
+        }
+    }
+    // a bare scale chain without the unary op isn't worth consuming nodes for
+    if (!unary_seen) {
+        return false;
+    }
+
+    return ggml_can_fuse(cgraph, node_idx, ops, num_extra + 1);
+}
+
 static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops) {
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
@@ -19393,6 +19576,24 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MUL_MAT_ADD";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_mm_tile_epilog(ctx, cgraph, i, 3)) {
+                ctx->num_additional_fused_ops = 3;
+                fusion_string = "MM_TILE_EPILOG";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+                op_srcs_fused_elementwise[3] = true;
+            } else if (ggml_vk_can_fuse_mm_tile_epilog(ctx, cgraph, i, 2)) {
+                ctx->num_additional_fused_ops = 2;
+                fusion_string = "MM_TILE_EPILOG";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+            } else if (ggml_vk_can_fuse_mm_tile_epilog(ctx, cgraph, i, 1)) {
+                ctx->num_additional_fused_ops = 1;
+                fusion_string = "MM_TILE_EPILOG";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse_mmv_epilog(ctx, cgraph, i, 3)) {
