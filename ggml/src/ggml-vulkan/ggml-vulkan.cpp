@@ -5251,15 +5251,18 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 wave32_tile(m_warptile_mmq_id128);
                 wave32_tile(l_warptile_mmq_idw);
             }
-            // GGML_VK_MMID_BN48=1: 48-wide medium mmid tile. MoE prefill leaves
-            // ~nei1*nei0/n_as live rows per expert (~40 at ub2048/512E/10a), so BN=64
-            // pads ~38% of the B/D tile lanes with dead compute; 48 pads ~17%. The only
-            // warp grid that tiles BMx48 is WN=48 (three 16x16 fragments per warp) with
-            // WM=BM/NUM_WARPS. The mul_mm B-load loop bounds-checks the last partial
-            // stride when BN stops being a multiple of it. Runs after WAVE32 so the
-            // final WARP value sizes the grid.
+            // 48-wide medium mmid tile (GGML_VK_MMID_BN48=0 reverts to 64). MoE prefill
+            // leaves ~nei1*nei0/n_as live rows per expert (~40 at ub2048/512E/10a), so
+            // BN=64 pads ~38% of the B/D tile lanes, 48 pads ~17%. Worth +1.4% d0 /
+            // +1.0% @32k, byte-identical (2026-08-30) - small because the expert GEMM
+            // sits at its weight-bandwidth roofline (~40 MACs/byte * ~133GB/s ~= the
+            // measured 8.7 TFLOPS), so lane fill is mostly latency, not throughput.
+            // The only warp grid that tiles BMx48 is WN=48 (three 16x16 fragments per
+            // warp) with WM=BM/NUM_WARPS. The mul_mm B-load loop bounds-checks the last
+            // partial stride when BN stops being a multiple of it. Runs after WAVE32 so
+            // the final WARP value sizes the grid.
             const char * bn48_env = getenv("GGML_VK_MMID_BN48");
-            if (bn48_env && atoi(bn48_env) != 0) {
+            if (!(bn48_env && atoi(bn48_env) == 0)) {
                 auto &w = m_warptile_mmq_id128;
                 const uint32_t num_warps = w[0] / w[10];
                 const uint32_t wm = w[1] / num_warps;
