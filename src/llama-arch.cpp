@@ -1109,11 +1109,13 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_BAILINGMOE3:
             return true;
         case LLM_ARCH_QWEN4EXP:
-            // qwen4exp builds its recurrent state through the same build_rs machinery as QWEN35
-            // (qwen4exp.cpp:1086 vs qwen35.cpp:391), so partial rollback should hold; without it
-            // n_rs_seq clamps to 0 and EVERY speculative rejection takes the checkpoint-restore
-            // path (a ~112 MiB memcpy per draft round, and a livelock when the restore+redecode
-            // is not numerically reproducible). Env-gated until validated on this arch.
+            // MEASURED 2026-08-30: partial rollback on this arch is LOSSY — the graph does not
+            // write the per-token rollback snapshot planes, so every restore lands on stale
+            // state and generation degrades progressively (violent at temp>0: gibberish within
+            // ~50 tokens, draft acceptance 64%->8% on the same probe). Env gate kept for
+            // experiments only; do NOT enable by default until the snapshot writes exist for
+            // this graph. Without it, rejections take the (exact) checkpoint-restore path and
+            // the server's replay non-convergence guard covers the livelock risk.
             return getenv("Q4X_RS_ROLLBACK") != nullptr;
         default:
             return false;

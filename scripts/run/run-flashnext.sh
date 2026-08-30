@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Serve Qwen3.8-Flash-Next on the REBASED flashnext-v2 build (build-v2). MTP self-speculative decode
-# is OPT-IN because it ONLY helps at TEMP 0 (greedy). MEASURED on this box (build-v2, single stream):
-#   temp 1.0 (this script's default creative sampling): MTP = WASH (25.7 vs 25.8) -> leave it OFF.
+# Serve Qwen3.8-Flash-Next on the REBASED flashnext-v2 build (build-v2). MTP self-speculative
+# decode is OPT-IN. MEASURED on this box (build-v2, single stream):
 #   temp 0 + code:            base 25.7 -> MTP 35.6  (+39%), and the gain GROWS with depth:
 #   temp 0 + code @ ~32k:     16.1 -> 28.9 (+79%);   @ ~64k: 12.0 -> 25.8 (+115%).
-# Rule: enable MTP only for DETERMINISTIC work (code / tools / extraction) run at TEMP=0.
+#   temp 1.0 + reasoning (2026-08-30, blk-topk build): MTP chat mean 31-32 t/s (peaks 38 on
+#     code-y prompts) vs ~26 without — the old "MTP is a wash at temp 1" is FIXED (it was
+#     partly the rollback quality bug + older build; stochastic spec sampling adds the rest).
+# Rule: MTP=1 is worth it at any temperature now; TEMP=0 remains the fastest for pure code.
 # Q4_K_XL is the only quant we keep. Creative sampling = unsloth thinking-mode rec.
-# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1] [FREE_GPU=1] [UBD=512] [KVD=q8_0] [MD=<draft.gguf>]
+# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1] [FREE_GPU=1] [UBD=512] [KVD=q8_0] [MD=<draft.gguf>] [SPEC_STOCH=1] [PMIN=0.75] [RSROLL=0] [BLKTOPK=1]
 #   Creative/chat (default):     ./run-flashnext.sh
 #   Fast deterministic code:     MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
+#   Fast reasoning/creative:     MTP=1 ./run-flashnext.sh   (temp 1, stoch spec sampling auto-on)
 export PATH="$PATH:/usr/sbin:/sbin"
 TOOLBOX=llama-nudge-vulkan
 BIN=/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin   # rebased build WITH MTP (old build/ has NO MTP)
@@ -63,15 +66,18 @@ VK_ENV=()
 # COOPMAT=0 is a global kill switch forcing KHR_coopmat OFF (regression fallback). Default is ON.
 [ "$COOPMAT" = "0" ] && VK_ENV=(GGML_VK_DISABLE_COOPMAT=1)
 # pass experiment env vars into the toolbox (toolbox run does not forward the host env)
-for _v in GGML_TOPK_LOG GGML_VK_EVENT_DEVICE_WAIT GGML_VK_EVENT_TL_OFF; do
+for _v in GGML_TOPK_LOG GGML_VK_EVENT_DEVICE_WAIT GGML_VK_EVENT_TL_OFF Q4X_SPEC_STOCH_TOPK Q4X_SPEC_STOCH_TEMP; do
   if [ -n "${!_v:-}" ]; then VK_ENV+=("$_v=${!_v}"); fi
 done
-# Q4X_RS_ROLLBACK: enable qwen4exp recurrent partial rollback (n_rs_seq=4). Without it every
-# speculative rejection restores a ~112 MiB checkpoint — and when coopmat's restore+redecode is
-# not bit-reproducible that restore loops forever (the historical "fence deadlock"/decode stall).
-# Validated 2026-08-29: 10/10 harness tasks, 0 restores, stall task 62s->7s. RSROLL=0 disables
-# (the server-side non-convergence guard then covers the livelock, at checkpoint-churn cost).
-[ "${RSROLL:-1}" != "0" ] && VK_ENV+=(Q4X_RS_ROLLBACK=1)
+# Q4X_RS_ROLLBACK: qwen4exp recurrent partial rollback (n_rs_seq=4). DEFAULT OFF — measured
+# 2026-08-30: partial rollback CORRUPTS the recurrent state on every speculative rejection
+# (the graph does not write the per-token snapshot planes the rollback ring restores from).
+# Invisible at temp 0 (few rejections, argmax robust); at temp>0 output degrades into gibberish
+# within ~50 tokens and draft acceptance collapses (8% vs 64% on the same probe). The
+# checkpoint-restore path is the exact one; its livelock risk is covered by the server-side
+# non-convergence guard (forces one plain decode step after 3 same-pos restores). RSROLL=1
+# re-enables rollback only for experiments until the snapshot writing is actually implemented.
+[ "${RSROLL:-0}" = "1" ] && VK_ENV+=(Q4X_RS_ROLLBACK=1)
 # Q4X_QSA_BLK_TOPK: block-level QSA indexer top-k. A/B 2026-08-30 (symmetric, 98k ctx): pp +25%
 # and tg +11% at 32-64k depth, pp +5% shallow, ~2GB less GTT at full ctx, needle retrieval
 # intact at 32k/64k, harness 10/10 — and the k=2051 CPU top_k fallback disappears (~14k
@@ -89,8 +95,15 @@ if [ "$MTP" = "1" ]; then
   # For genuinely deeper jobs pick ONE: MD=<...MTP-Q4_K_M.gguf> (frees 1.35GB, full 128k proven, but
   # shallow decode drops 44->32 t/s at 74% accept, and the box peaks at free=0) or UB=512 (pp at 128k
   # is within 6.5% of ub2048 anyway: 141.5 vs 150.7).
-  MTP_ARGS=(-md "$MD" --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75
+  PMIN="${PMIN:-0.75}"  # draft confidence gate; tuned for greedy drafting — with SPEC_STOCH at
+                        # temp>0 the draft's max-prob is flatter, so a lower PMIN drafts deeper
+  MTP_ARGS=(-md "$MD" --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min "$PMIN"
             --spec-draft-ubatch "$UBD" --spec-draft-type-k "$KVD" --spec-draft-type-v "$KVD")
+  # Q4X_SPEC_STOCH: stochastic speculative sampling — the draft SAMPLES with the target's
+  # sampling params and the server verifies by rejection sampling (lossless for the target
+  # distribution). Recovers the MTP speedup at temp>0, where exact-match verification made it
+  # a wash. No effect at TEMP=0 (falls back to greedy semantics). SPEC_STOCH=0 disables.
+  [ "${SPEC_STOCH:-1}" != "0" ] && [ "${TEMP:-0}" != "0" ] && VK_ENV+=(Q4X_SPEC_STOCH=1)
   # HISTORY: coopmat under MTP used to DEADLOCK the GPU — a KHR_coopmat matmul shader's Vulkan fence never
   # signalled on the small speculative batch shapes (llama_decode spun in ggml_vk_wait_for_fence, no
   # device-lost). FIXED 2026-08-29 by ordering the cross-backend event wait through its timeline semaphore
