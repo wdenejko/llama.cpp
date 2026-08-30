@@ -627,8 +627,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool blk_topk, bool pooled) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias), blk_topk(blk_topk), pooled(pooled) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool blk_topk, bool pooled, bool pooled_score) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), blk_topk(blk_topk), pooled(pooled), pooled_score(pooled_score) {}
     virtual ~llm_graph_input_qsa() = default;
 
     // [TAG_QSA_POOLED_CACHE] the store keeps one sequence's summaries of one stream, so the
@@ -678,9 +678,10 @@ public:
         res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
 
-        // [TAG_QSA_POOLED_CACHE] the graph committed to reading the store or recomputing when it
-        // was built; an ubatch on the other side of that line needs the other graph
+        // [TAG_QSA_POOLED_CACHE] the graph committed to its write/score paths when it was
+        // built; an ubatch on the other side of either line needs the other graph
         res &= pooled == (pooled_usable(mctx, params.ubatch) && n_stream == 1);
+        res &= pooled_score == (pooled && params.ubatch.n_tokens <= 16);
 
         if (pooled) {
             // the summary view and the k_all gather view are both sized by the build-time n_kv
@@ -689,7 +690,9 @@ public:
             // a watermark clamp (rollback, sequence switch) can ask for more rows than the
             // built tensors hold; the fill pads any excess capacity with dustbin writes
             res &= mctx->qsa_pooled_n_dirty_max(&params.ubatch, ratio) <= dirty_rows->ne[0];
-        } else {
+        }
+
+        if (!pooled_score) {
             res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
             res &= blk_cells->ne[1] == n_stream;
             res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
@@ -739,9 +742,14 @@ public:
     // select whole blocks from the per-block scores (never expanding to per-cell scores); needs blk_bias
     const bool blk_topk;
 
-    // score against the pooled summary store, writing only newly complete blocks, instead of
-    // re-pooling every block every graph
+    // maintain the pooled summary store: write each ubatch's newly complete blocks
     const bool pooled;
+
+    // ALSO score from the store instead of re-pooling every block. Decode-sized batches only:
+    // at prefill widths the store read's extra barriers cost more than the recompute it saves
+    // (measured -2.5% pp @32k), while at decode it is +6-8% tg -- so prefill graphs write the
+    // store but keep the recompute scoring
+    const bool pooled_score;
 
     // n_kv the graph was built for; can_reuse needs it when cell_blk is absent (blk_topk)
     int64_t n_kv_build = 0;
@@ -784,11 +792,15 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
     static const bool blk_topk_env = getenv("Q4X_QSA_BLK_TOPK") != nullptr;
     const bool blk_topk = blk_topk_env && blk_bias;
 
-    // [TAG_QSA_POOLED_CACHE] a complete block's summary never changes, so score against the
-    // pooled store and only compute the blocks this ubatch completes -- O(new) work per graph
-    // instead of O(n_kv). Allocation already gated on the unified layout; here the ubatch must
-    // also be a single sequence in a single stream, or the graph falls back to recomputing
-    const bool pooled_use = llm_graph_input_qsa::pooled_usable(mctx_hyb, ubatch) && n_stream == 1;
+    // [TAG_QSA_POOLED_CACHE] a complete block's summary never changes, so keep a store of them:
+    // every eligible ubatch writes the blocks it completes (cheap), and decode-sized batches
+    // also SCORE from the store -- O(new) instead of O(n_kv) per token (+6-8% tg at depth).
+    // Prefill keeps the recompute scoring: at 2048-token widths the store read's extra
+    // barriers cost more than the recompute they save (measured -2.5% pp @32k).
+    // Allocation already gated on the unified layout; the ubatch must also be a single
+    // sequence in a single stream, or the graph falls back to recompute-only
+    const bool pooled_use       = llm_graph_input_qsa::pooled_usable(mctx_hyb, ubatch) && n_stream == 1;
+    const bool pooled_score_use = pooled_use && n_tokens <= 16;
 
     // [TAG_QSA_GATHER] when the attention will gather the selected rows, the selection widens
     // to the gather's padded row count here, so both ends agree on one width
@@ -803,7 +815,7 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, blk_topk, pooled_use);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, blk_topk, pooled_use, pooled_score_use);
 
         qsa->k_idxs = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->bias   = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
@@ -811,7 +823,8 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
         ggml_set_input(qsa->bias);
 
         // an input the graph never consumes is never allocated, and set_input would then write
-        // through a null buffer -- so each branch creates exactly the tensors its graph reads
+        // through a null buffer -- so create exactly the tensors this graph's paths read:
+        // the dirty list feeds the store write, the gather tables feed recompute scoring
         if (pooled_use) {
             const int64_t n_dirty = mctx_hyb->qsa_pooled_n_dirty_max(&ubatch, (uint32_t) r);
 
@@ -822,7 +835,8 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
             ggml_set_input(qsa->dirty_cells);
             ggml_set_input(qsa->dirty_pos);
             ggml_set_input(qsa->dirty_rows);
-        } else {
+        }
+        if (!pooled_score_use) {
             qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
             qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
 
@@ -900,10 +914,16 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
         // expanded before the score below is built, so the write orders ahead of the read
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, store, sum, inp->dirty_rows));
 
-        pooled = ggml_view_3d(ctx0, store, idx_dim, n_blocks, 1,
-                store->nb[1], store->nb[1]*n_blocks, 0);
-        cb(pooled, "indexer_k", il);
-    } else {
+        // decode-sized batches score straight from the store; prefill graphs only write it
+        // and fall through to the recompute scoring below
+        if (inp->pooled_score) {
+            pooled = ggml_view_3d(ctx0, store, idx_dim, n_blocks, 1,
+                    store->nb[1], store->nb[1]*n_blocks, 0);
+            cb(pooled, "indexer_k", il);
+        }
+    }
+
+    if (pooled == nullptr) {
         // gathers per stream: blk_cells row s indexes stream s's own cells
         ggml_tensor * members = ggml_get_rows(ctx0, k_all, inp->blk_cells);
         members = ggml_reshape_4d(ctx0, members, idx_dim, r, n_blocks, n_stream);
