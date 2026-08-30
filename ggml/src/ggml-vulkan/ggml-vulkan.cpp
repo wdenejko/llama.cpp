@@ -5251,6 +5251,26 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 wave32_tile(m_warptile_mmq_id128);
                 wave32_tile(l_warptile_mmq_idw);
             }
+            // GGML_VK_MMID_BN48=1: 48-wide medium mmid tile. MoE prefill leaves
+            // ~nei1*nei0/n_as live rows per expert (~40 at ub2048/512E/10a), so BN=64
+            // pads ~38% of the B/D tile lanes with dead compute; 48 pads ~17%. The only
+            // warp grid that tiles BMx48 is WN=48 (three 16x16 fragments per warp) with
+            // WM=BM/NUM_WARPS. The mul_mm B-load loop bounds-checks the last partial
+            // stride when BN stops being a multiple of it. Runs after WAVE32 so the
+            // final WARP value sizes the grid.
+            const char * bn48_env = getenv("GGML_VK_MMID_BN48");
+            if (bn48_env && atoi(bn48_env) != 0) {
+                auto &w = m_warptile_mmq_id128;
+                const uint32_t num_warps = w[0] / w[10];
+                const uint32_t wm = w[1] / num_warps;
+                if (w[1] % num_warps == 0 && wm >= w[7] && 48 % w[8] == 0) {
+                    w[2] = 48;  // BN
+                    w[4] = wm;  // WM
+                    w[5] = 48;  // WN
+                    m_mmq_wg_denoms_id128[1] = 48;
+                    fprintf(stderr, "ggml_vulkan: MUL_MAT_ID medium tile BN=48 (WM=%u WN=48)\n", wm);
+                }
+            }
         }
         {
         const auto &s_warptile_mmq = s_warptile_mmq_id16;
@@ -11000,7 +11020,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
 
     // Reserve extra storage in the N dimension for the Y matrix, so we can avoid bounds-checking
-    uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) :ne11;
+    // wg_denoms[1] can be non-pow2 (the 48-wide mmid tile), so round up arithmetically
+    uint32_t padded_n = qy_needs_dequant ? CEIL_DIV(ne11, pipeline->wg_denoms[1]) * pipeline->wg_denoms[1] : ne11;
     const uint64_t x_ne = ggml_nelements(src0);
     const uint64_t y_ne = (uint64_t)y_staged_row_stride * padded_n * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);

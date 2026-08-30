@@ -363,11 +363,15 @@ void main() {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
         }
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+            // BN that is not a multiple of the load stride (e.g. the 48-wide mmid tile)
+            // leaves the last stride partial; the compare folds away for the pow2 tiles
+            if (BN % loadstride_b == 0 || loadc_b + l < BN) {
 #if !defined(MUL_MAT_ID)
-            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
+                load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
 #else
-            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
+                load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
 #endif
+            }
         }
 
         barrier();
