@@ -1055,11 +1055,14 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
 // gathered-row count, or 0 for the masked-dense path; build_qsa_top_k widens its selection by
 // the same call, so the attention gathers exactly what was selected.
 int64_t llama_model_qwen4exp::graph::qsa_gather_n_sel(int64_t n_kv, int64_t width, int64_t r) const {
-    // Q4X_QSA_GATHER: unset -> gather from 32768 cells; <= 0 -> off; N -> gather from N (1 = always)
+    // Q4X_QSA_GATHER: unset or <= 0 -> OFF; N -> gather from N cells (1 = always).
+    // Default flipped to off 2026-08-30: the first honest on/off A/B (the auto-on-at-32768
+    // default had silently been active in every deep measurement) has masked-dense ahead at
+    // every depth tried - 47.0 vs 46.1 tg @32k, 45.3 vs 37.2 @48k
     static const int64_t min_kv = [] {
         const char * env = getenv("Q4X_QSA_GATHER");
         if (env == nullptr) {
-            return (int64_t) 32768;
+            return (int64_t) INT64_MAX;
         }
         const long long v = atoll(env);
         return v <= 0 ? (int64_t) INT64_MAX : (int64_t) v;

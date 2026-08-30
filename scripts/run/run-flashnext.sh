@@ -84,10 +84,9 @@ done
 # intact at 32k/64k, harness 10/10 — and the k=2051 CPU top_k fallback disappears (~14k
 # dispatches/run -> 0). Costs ~3pt draft acceptance (net tg still ahead). BLKTOPK=0 disables.
 [ "${BLKTOPK:-1}" != "0" ] && VK_ENV+=(Q4X_QSA_BLK_TOPK=1)
-# Q4X_QSA_GATHER: gathered QSA decode attention (deep-context tg lever). Unset = the binary's
-# internal 32768-cell threshold; GATHER=0 -> off; GATHER=N -> gather from N cells (1 = always).
-# UNVALIDATED port (2026-08-30, from the apepojken fork 28c9d7302 + our dup-slot mask fix);
-# identity + perf A/B pending, so no default is forced here.
+# Q4X_QSA_GATHER: gathered QSA decode attention. OFF by default in the binary (honest A/B:
+# masked-dense wins at every depth - 47.0 vs 46.1 tg @32k, 45.3 vs 37.2 @48k; identity is
+# byte-equal, so this is purely a perf call). GATHER=N re-enables from N cells (1 = always).
 [ -n "${GATHER:-}" ] && VK_ENV+=(Q4X_QSA_GATHER="$GATHER")
 # POOLED=0 disables the QSA pooled-key summary cache (default on in the binary; this is the
 # recompute-every-graph fallback for A/B and debugging).
