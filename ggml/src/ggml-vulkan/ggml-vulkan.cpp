@@ -5267,11 +5267,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 const uint32_t num_warps = w[0] / w[10];
                 const uint32_t wm = w[1] / num_warps;
                 if (w[1] % num_warps == 0 && wm >= w[7] && 48 % w[8] == 0) {
+                    // no log here: ggml_vk_load_shaders re-runs per lazy compile batch
+                    // and would spam it; GGML_VK_MMID_PROBE=1 shows the tile in use
                     w[2] = 48;  // BN
                     w[4] = wm;  // WM
                     w[5] = 48;  // WN
                     m_mmq_wg_denoms_id128[1] = 48;
-                    fprintf(stderr, "ggml_vulkan: MUL_MAT_ID medium tile BN=48 (WM=%u WN=48)\n", wm);
                 }
             }
         }
