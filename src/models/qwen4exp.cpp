@@ -683,13 +683,18 @@ public:
         res &= pooled == (pooled_usable(mctx, params.ubatch) && n_stream == 1);
         res &= pooled_score == (pooled && params.ubatch.n_tokens <= 16);
 
-        if (pooled) {
+        if (pooled_score) {
             // the summary view and the k_all gather view are both sized by the build-time n_kv
             res &= n_kv_build == n_kv;
 
             // a watermark clamp (rollback, sequence switch) can ask for more rows than the
             // built tensors hold; the fill pads any excess capacity with dustbin writes
-            res &= mctx->qsa_pooled_n_dirty_max(&params.ubatch, ratio) <= dirty_rows->ne[0];
+            const int64_t need = mctx->qsa_pooled_n_dirty_max(&params.ubatch, ratio);
+            res &= need <= dirty_rows->ne[0];
+
+            // and a catch-up-sized graph must not persist into steady decode, where its
+            // full-width dustbin-padded write chain would run every token
+            res &= dirty_rows->ne[0] <= 4*need + 8;
         }
 
         if (!pooled_score) {
@@ -742,13 +747,13 @@ public:
     // select whole blocks from the per-block scores (never expanding to per-cell scores); needs blk_bias
     const bool blk_topk;
 
-    // maintain the pooled summary store: write each ubatch's newly complete blocks
+    // the pooled summary store is usable for this ubatch (single sequence, single stream)
     const bool pooled;
 
-    // ALSO score from the store instead of re-pooling every block. Decode-sized batches only:
-    // at prefill widths the store read's extra barriers cost more than the recompute it saves
-    // (measured -2.5% pp @32k), while at decode it is +6-8% tg -- so prefill graphs write the
-    // store but keep the recompute scoring
+    // write the completed-since-watermark blocks into the store and score from it, instead of
+    // re-pooling every block. Decode-sized batches only: the write chain measured ~3% pp at
+    // prefill widths, while scoring from the store is +6-8% tg at decode -- so prefill keeps
+    // pure recompute and the first decode graph catches up the store in one write
     const bool pooled_score;
 
     // n_kv the graph was built for; can_reuse needs it when cell_blk is absent (blk_topk)
@@ -792,11 +797,10 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
     static const bool blk_topk_env = getenv("Q4X_QSA_BLK_TOPK") != nullptr;
     const bool blk_topk = blk_topk_env && blk_bias;
 
-    // [TAG_QSA_POOLED_CACHE] a complete block's summary never changes, so keep a store of them:
-    // every eligible ubatch writes the blocks it completes (cheap), and decode-sized batches
-    // also SCORE from the store -- O(new) instead of O(n_kv) per token (+6-8% tg at depth).
-    // Prefill keeps the recompute scoring: at 2048-token widths the store read's extra
-    // barriers cost more than the recompute they save (measured -2.5% pp @32k).
+    // [TAG_QSA_POOLED_CACHE] a complete block's summary never changes, so decode-sized batches
+    // keep a store of them and score O(new) instead of O(n_kv) per token (+6-8% tg at depth).
+    // Prefill stays pure recompute -- the store write chain alone measured ~3% pp -- and the
+    // first decode graph catches the store up over the whole prefilled span in one write.
     // Allocation already gated on the unified layout; the ubatch must also be a single
     // sequence in a single stream, or the graph falls back to recompute-only
     const bool pooled_use       = llm_graph_input_qsa::pooled_usable(mctx_hyb, ubatch) && n_stream == 1;
@@ -824,8 +828,11 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
 
         // an input the graph never consumes is never allocated, and set_input would then write
         // through a null buffer -- so create exactly the tensors this graph's paths read:
-        // the dirty list feeds the store write, the gather tables feed recompute scoring
-        if (pooled_use) {
+        // the dirty list feeds the store write, the gather tables feed recompute scoring.
+        // [TAG_QSA_POOLED_CACHE] writes are lazy: prefill graphs skip the store entirely
+        // (the write chain measured ~3% pp) and the first decode graph catches up the whole
+        // span in one write, sized by the same qsa_pooled_n_dirty_max
+        if (pooled_score_use) {
             const int64_t n_dirty = mctx_hyb->qsa_pooled_n_dirty_max(&ubatch, (uint32_t) r);
 
             qsa->dirty_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_dirty, 1);
@@ -879,9 +886,10 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
 
     ggml_tensor * pooled = nullptr;
 
-    if (inp->pooled) {
-        // [TAG_QSA_POOLED_CACHE] pool only the blocks this ubatch completes, write their summary
-        // rows into the layer's store, and score against the store. Rows past the watermark hold
+    if (inp->pooled_score) {
+        // [TAG_QSA_POOLED_CACHE] pool the blocks completed since the watermark (after a prefill
+        // this is one catch-up covering the whole new span), write their summary rows into the
+        // layer's store, and score against the store. Rows past the watermark hold
         // stale-but-finite values whose scores the bias masks, like the garbage partial pools
         ggml_tensor * store = mctx_hyb->get_pooled_k(il);
         GGML_ASSERT(store != nullptr);
@@ -914,13 +922,9 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
         // expanded before the score below is built, so the write orders ahead of the read
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, store, sum, inp->dirty_rows));
 
-        // decode-sized batches score straight from the store; prefill graphs only write it
-        // and fall through to the recompute scoring below
-        if (inp->pooled_score) {
-            pooled = ggml_view_3d(ctx0, store, idx_dim, n_blocks, 1,
-                    store->nb[1], store->nb[1]*n_blocks, 0);
-            cb(pooled, "indexer_k", il);
-        }
+        pooled = ggml_view_3d(ctx0, store, idx_dim, n_blocks, 1,
+                store->nb[1], store->nb[1]*n_blocks, 0);
+        cb(pooled, "indexer_k", il);
     }
 
     if (pooled == nullptr) {

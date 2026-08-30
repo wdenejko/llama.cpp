@@ -18645,12 +18645,14 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
         if (mmid != mul->src[0]) {
             return false;
         }
-        // EXPERIMENT (GGML_VK_MMID_SCALE_EPILOGUE=1): the tile shader can apply the scale as it
-        // writes out, which removes a full write+read of the matmul result at prefill. The
-        // coopmat2 shader has the binding but not the epilogue, so it stays on the old path.
+        // The tile shader can apply the scale as it writes out, which removes a full
+        // write+read of the matmul result at prefill (+1.3% pp measured on gfx1151,
+        // decode-neutral). Default ON since 2026-08-30; GGML_VK_MMID_SCALE_EPILOGUE=0
+        // reverts. The coopmat2 shader has the binding but not the epilogue, so it
+        // stays on the old path.
         if (!ggml_vk_use_mul_mat_vec_id(cgraph, node_idx)) {
             static const char * env = getenv("GGML_VK_MMID_SCALE_EPILOGUE");
-            if (!(env && atoi(env) != 0) || ctx->device->coopmat2) {
+            if ((env && atoi(env) == 0) || ctx->device->coopmat2) {
                 return false;
             }
             // Shader indexes the scale as [token * nei0 + expert_slot].
