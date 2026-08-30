@@ -9499,6 +9499,12 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
         const vk_pipeline & pl = aligned ? mmp->a_l : mmp->l;
         const uint32_t tiles_l = CEIL_DIV(m, pl->wg_denoms[0]) * CEIL_DIV(n, pl->wg_denoms[1]);
         if (tiles_l < 2 * ctx->device->shader_core_count) {
+            static bool thin_bm_logged = false;
+            if (!thin_bm_logged) {
+                thin_bm_logged = true;
+                fprintf(stderr, "[thin-bm] medium-tile reroute engaged (first hit m=%u n=%u tiles_l=%u cores=%u)\n",
+                        m, n, tiles_l, ctx->device->shader_core_count);
+            }
             return aligned ? mmp->a_m : mmp->m;
         }
     }
@@ -11053,14 +11059,16 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     static const char * mmid_row_lists_env = getenv("GGML_VK_MMID_ROWLISTS");
     const bool use_row_lists = !(mmid_row_lists_env && atoi(mmid_row_lists_env) == 0) && !ctx->device->coopmat2;
 
-    // EXPERIMENT (GGML_VK_MMID_COMPACT=1): dispatch the matmul over a prepass-built list of
-    // live (expert, tile) pairs instead of one z-slice per expert. At MoE prefill (n_as=512,
-    // ~40 rows/expert, BN=64) the z-slice grid launches ~32x more workgroups than have any
-    // rows, and the dead launches are a large share of the node's runtime. Needs the row-list
-    // prepass (it builds the tile list) and the scalar/coopmat1 tile shader (mmq ignores the
-    // field, so quantize_y keeps the classic grid).
+    // Dispatch the matmul over a prepass-built list of live (expert, tile) pairs instead of
+    // one z-slice per expert. At MoE prefill (n_as=512, ~40 rows/expert, BN=64) the z-slice
+    // grid launches ~32x more workgroups than have any rows; skipping the dead launches is
+    // worth ~1% pp (measured 2026-08-30, byte-identical output) - the early-outs are nearly
+    // free on RDNA3.5, so the expert GEMM's efficiency gap lives inside the live tiles, not
+    // here. Default on; GGML_VK_MMID_COMPACT=0 reverts to the z-slice grid. Needs the
+    // row-list prepass (it builds the tile list) and the scalar/coopmat1 tile shader (mmq
+    // ignores the field, so quantize_y keeps the classic grid).
     static const char * mmid_compact_env = getenv("GGML_VK_MMID_COMPACT");
-    const bool use_compact = (mmid_compact_env && atoi(mmid_compact_env) != 0) &&
+    const bool use_compact = !(mmid_compact_env && atoi(mmid_compact_env) == 0) &&
                              use_row_lists && !quantize_y;
 
     const uint32_t compact_bn    = use_compact ? pipeline->wg_denoms[1] : 0;
