@@ -88,6 +88,9 @@ done
 # UNVALIDATED port (2026-08-30, from the apepojken fork 28c9d7302 + our dup-slot mask fix);
 # identity + perf A/B pending, so no default is forced here.
 [ -n "${GATHER:-}" ] && VK_ENV+=(Q4X_QSA_GATHER="$GATHER")
+# POOLED=0 disables the QSA pooled-key summary cache (default on in the binary; this is the
+# recompute-every-graph fallback for A/B and debugging).
+[ "${POOLED:-1}" = "0" ] && VK_ENV+=(LLAMA_QSA_NO_POOLED_CACHE=1)
 if [ "$MTP" = "1" ]; then
   # draft-mtp ONLY. Do NOT add ngram-mod (its 48-64 tok drafts regress acceptance here).
   # p-min 0.75 gates low-confidence drafts (keeps prose from regressing).
