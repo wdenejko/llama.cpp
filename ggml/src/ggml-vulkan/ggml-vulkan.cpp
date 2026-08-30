@@ -9490,6 +9490,18 @@ static vk_pipeline ggml_vk_guess_matmul_pipeline(ggml_backend_vk_context * ctx, 
     if ((mm_m && (m <= 64 || n <= 64)) || !mm_l) {
         return aligned ? mmp->a_m : mmp->m;
     }
+    // [Q4X] skinny-M GEMMs land in a dead zone: the large-tile grid underfills the
+    // GPU (m=320 n=2048 -> 48 WGs on 40 CUs) but has too many tiles for split_k to
+    // engage. Prefer the medium tile there for the workgroup parallelism, like the
+    // coopmat2 branch above does via its tiles-vs-core-count heuristic.
+    static const char * thin_bm_env = getenv("GGML_VK_DENSE_THIN_BM");
+    if (thin_bm_env && atoi(thin_bm_env) != 0 && mm_m && ctx->device->shader_core_count != 0) {
+        const vk_pipeline & pl = aligned ? mmp->a_l : mmp->l;
+        const uint32_t tiles_l = CEIL_DIV(m, pl->wg_denoms[0]) * CEIL_DIV(n, pl->wg_denoms[1]);
+        if (tiles_l < 2 * ctx->device->shader_core_count) {
+            return aligned ? mmp->a_m : mmp->m;
+        }
+    }
     return aligned ? mmp->a_l : mmp->l;
 }
 
