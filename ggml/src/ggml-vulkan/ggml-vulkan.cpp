@@ -18722,8 +18722,10 @@ static bool ggml_vk_can_fuse_mmv_epilog(const ggml_backend_vk_context * ctx, con
 // M-splitting, no fwht; split_k is forced off at dispatch when the fusion fires.
 static bool ggml_vk_can_fuse_mm_tile_epilog(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                             int node_idx, int num_extra) {
+    // Default on: +1.6% pp d0 / +1.0% @32k measured on gfx1151 (2026-08-30),
+    // engagement on the HC low-rank silu gates. =0 reverts.
     static const char * env = getenv("GGML_VK_MM_TILE_EPILOG");
-    if (!(env && atoi(env) != 0)) {
+    if (env && atoi(env) == 0) {
         return false;
     }
     // the coopmat2 matmul shader doesn't read the epilog push constants
