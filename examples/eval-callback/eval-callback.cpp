@@ -19,6 +19,9 @@ struct q4x_topk_dump_state {
     FILE * f = nullptr;
     const char * filter = nullptr;
     int remaining = 0;
+    int skip = 0;  // Q4X_TOPK_DUMP_SKIP: drop this many matches first (early
+                   // ubatches select everything while n_kv <= k - only the
+                   // deep ubatches carry a real sparsity pattern)
 };
 
 static bool q4x_topk_dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -26,11 +29,16 @@ static bool q4x_topk_dump_cb(struct ggml_tensor * t, bool ask, void * user_data)
     const bool match = st->remaining > 0 &&
                        t->type == GGML_TYPE_I32 &&
                        t->ne[1] >= 512 &&
-                       strstr(t->name, st->filter) != nullptr;
+                       strstr(t->name, st->filter) != nullptr &&
+                       strstr(t->name, "(view)") == nullptr;
     if (ask) {
         return match;
     }
     if (!match) {
+        return true;
+    }
+    if (st->skip > 0) {
+        st->skip--;
         return true;
     }
     const size_t n = ggml_nelements(t);
@@ -103,8 +111,10 @@ int main(int argc, char ** argv) {
         }
         const char * filt = getenv("Q4X_TOPK_DUMP_FILTER");
         const char * maxs = getenv("Q4X_TOPK_DUMP_MAX");
+        const char * skps = getenv("Q4X_TOPK_DUMP_SKIP");
         dump_state.filter    = filt ? filt : "indexer_top_k";
         dump_state.remaining = maxs ? atoi(maxs) : 24;
+        dump_state.skip      = skps ? atoi(skps) : 0;
         params.cb_eval = q4x_topk_dump_cb;
         params.cb_eval_user_data = &dump_state;
     } else {
