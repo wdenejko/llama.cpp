@@ -64,6 +64,11 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
 layout (binding = 1) readonly buffer B_SCALAR {B_TYPE_SCALAR data_b_scalar[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+#ifndef MUL_MAT_ID
+// [MM_TILE_EPILOG] operand of a fused trailing MUL. Always bound (dummy when
+// unused); read only when fusion_flags bit 2 is set. Same shape/stride as D.
+layout (binding = 3) readonly buffer FMUL {float data_fmul[];};
+#endif
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
@@ -456,12 +461,16 @@ void main() {
     // [MM_TILE_EPILOG] fused [scale] sigmoid|silu [scale], computed in f32 on the
     // accumulators. split_k never runs with fusion, so the sums are complete here.
     if (p.fusion_flags != 0u) {
+        const bool ep_unary = (p.fusion_flags & 3u) != 0u;
+        const bool ep_silu  = (p.fusion_flags & 2u) != 0u;
 #ifdef COOPMAT
         [[unroll]] for (uint j = 0; j < cms_per_row * cms_per_col; j++) {
             [[unroll]] for (uint i = 0; i < sums[j].length(); ++i) {
                 float fv = float(sums[j][i]) * p.fuse_scale_pre;
-                const float sig = 1.0f / (1.0f + exp(-fv));
-                fv = ((p.fusion_flags & 2u) != 0u) ? fv * sig : sig;
+                if (ep_unary) {
+                    const float sig = 1.0f / (1.0f + exp(-fv));
+                    fv = ep_silu ? fv * sig : sig;
+                }
                 sums[j][i] = ACC_TYPE(fv * p.fuse_scale_post);
             }
         }
@@ -469,11 +478,12 @@ void main() {
         [[unroll]] for (uint i = 0; i < WMITER*TM*WNITER*TN/2; i++) {
             float fx = float(sums[i].x) * p.fuse_scale_pre;
             float fy = float(sums[i].y) * p.fuse_scale_pre;
-            const float sx = 1.0f / (1.0f + exp(-fx));
-            const float sy = 1.0f / (1.0f + exp(-fy));
-            const bool is_silu = (p.fusion_flags & 2u) != 0u;
-            fx = is_silu ? fx * sx : sx;
-            fy = is_silu ? fy * sy : sy;
+            if (ep_unary) {
+                const float sx = 1.0f / (1.0f + exp(-fx));
+                const float sy = 1.0f / (1.0f + exp(-fy));
+                fx = ep_silu ? fx * sx : sx;
+                fy = ep_silu ? fy * sy : sy;
+            }
             sums[i].x = ACC_TYPE(fx * p.fuse_scale_post);
             sums[i].y = ACC_TYPE(fy * p.fuse_scale_post);
         }
@@ -519,17 +529,23 @@ void main() {
         [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
             const bool is_in_bounds = dr + (cm_row + 1) * TM <= p.M && dc + (cm_col + 1) * TN <= p.N;
 
-            if (is_aligned && is_in_bounds) {
+            // [MM_TILE_EPILOG] a fused trailing MUL needs per-element indices, so it
+            // routes through the staged paths below instead of the direct coopMatStore
+            const bool ep_mul = (p.fusion_flags & 4u) != 0u;
+            if (is_aligned && is_in_bounds && !ep_mul) {
                 // Full coopMat is within bounds and stride_d is aligned with 16B
                 coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> cm_dtype = coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums[cm_col * cms_per_row + cm_row]);
                 coopMatStore(cm_dtype, data_d, offsets + (dc + cm_col * TN) * p.stride_d + dr + cm_row * TM, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
             } else if (is_in_bounds) {
-                // Full coopMat is within bounds, but stride_d is not aligned
+                // Full coopMat is within bounds (staged: unaligned stride or fused MUL)
                 coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
 
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
-                    data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    const uint didx = offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r;
+                    float sv = float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    if (ep_mul) { sv *= data_fmul[didx]; }
+                    data_d[didx] = D_TYPE(sv);
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
             } else if (dr + cm_row * TM < p.M && dc + cm_col * TN < p.N) {
@@ -539,7 +555,10 @@ void main() {
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
                     if (dr + cm_row * TM + store_r < p.M && dc + cm_col * TN + col + store_c < p.N) {
-                        data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                        const uint didx = offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r;
+                        float sv = float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                        if (ep_mul) { sv *= data_fmul[didx]; }
+                        data_d[didx] = D_TYPE(sv);
                     }
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
@@ -575,10 +594,12 @@ void main() {
                     }
 #else
                     if (dr_warp + 2 * cr < p.M && dc_warp + cc < p.N) {
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x);
+                        const uint didx = offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr;
+                        data_d[didx] = ((p.fusion_flags & 4u) != 0u) ? D_TYPE(float(sums[sums_idx].x) * data_fmul[didx]) : D_TYPE(sums[sums_idx].x);
                     }
                     if (dr_warp + 2 * cr + 1 < p.M && dc_warp + cc < p.N) {
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y);
+                        const uint didx = offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr + 1;
+                        data_d[didx] = ((p.fusion_flags & 4u) != 0u) ? D_TYPE(float(sums[sums_idx].y) * data_fmul[didx]) : D_TYPE(sums[sums_idx].y);
                     }
 #endif // MUL_MAT_ID
                 }

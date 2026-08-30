@@ -1307,6 +1307,7 @@ struct vk_mat_mat_push_constants {
 
 #define MM_TILE_FUSION_SIGMOID 0x1
 #define MM_TILE_FUSION_SILU    0x2
+#define MM_TILE_FUSION_MUL     0x4
 
 #define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
@@ -2583,6 +2584,7 @@ struct ggml_backend_vk_context {
     float fused_mm_tile_scale_pre {1.0f};
     float fused_mm_tile_scale_post {1.0f};
     int32_t fused_mm_tile_prec {};
+    const ggml_tensor * fused_mm_tile_mul {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -4976,43 +4978,43 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         CREATE_MM(PIPELINE_NAME . f16acc, NAMELC, _f16acc, WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT)   \
         CREATE_MM(PIPELINE_NAME . f32acc, NAMELC, , WG_DENOMS, WARPTILE, PUSHCONST, PARAMCOUNT)   \
 
-        CREATE_MM2(pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 3)
+        CREATE_MM2(pipeline_matmul_f16, matmul_f16, wg_denoms, warptile, vk_mat_mat_push_constants, 4)
 #if defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
         if (device->coopmat_bf16_support) {
-            CREATE_MM(pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 3)
+            CREATE_MM(pipeline_matmul_bf16, matmul_bf16, , wg_denoms, warptile, vk_mat_mat_push_constants, 4)
         }
 #endif
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q1_0], matmul_q1_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q2_0], matmul_q2_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_0], matmul_q4_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_1], matmul_q4_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_0], matmul_q5_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_1], matmul_q5_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q8_0], matmul_q8_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q2_K], matmul_q2_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_TQ2_0], matmul_tq2_0_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q3_K], matmul_q3_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_K], matmul_q4_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_K], matmul_q5_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q6_K], matmul_q6_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ1_S],   matmul_iq1_s_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ1_M],   matmul_iq1_m_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ2_XXS], matmul_iq2_xxs_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ2_XS],  matmul_iq2_xs_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ2_S],   matmul_iq2_s_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ3_XXS], matmul_iq3_xxs_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ3_S],   matmul_iq3_s_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_XS],  matmul_iq4_xs_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_NL],  matmul_iq4_nl_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q1_0], matmul_q1_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q2_0], matmul_q2_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_0], matmul_q4_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_1], matmul_q4_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_0], matmul_q5_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_1], matmul_q5_1_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q8_0], matmul_q8_0_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q2_K], matmul_q2_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_TQ2_0], matmul_tq2_0_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q3_K], matmul_q3_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q4_K], matmul_q4_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q5_K], matmul_q5_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_Q6_K], matmul_q6_k_f16, mmq_wg_denoms_k, warptile_mmq_k, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ1_S],   matmul_iq1_s_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ1_M],   matmul_iq1_m_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ2_XXS], matmul_iq2_xxs_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ2_XS],  matmul_iq2_xs_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ2_S],   matmul_iq2_s_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ3_XXS], matmul_iq3_xxs_f16, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ3_S],   matmul_iq3_s_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_XS],  matmul_iq4_xs_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+        CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_IQ4_NL],  matmul_iq4_nl_f16,  mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (device->ocp_fp4) {
-            CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_MXFP4],   matmul_mxfp4_f16_ocp,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-            CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_NVFP4],   matmul_nvfp4_f16_ocp,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
+            CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_MXFP4],   matmul_mxfp4_f16_ocp,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+            CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_NVFP4],   matmul_nvfp4_f16_ocp,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
         } else
 #endif
         {
-            CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_MXFP4],   matmul_mxfp4_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
-            CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_NVFP4],   matmul_nvfp4_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3)
+            CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_MXFP4],   matmul_mxfp4_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
+            CREATE_MM2(pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_NVFP4],   matmul_nvfp4_f16,   mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4)
         }
 
         GGML_ASSERT(device->subgroup_ballot);
@@ -9594,7 +9596,8 @@ static void ggml_vk_matmul(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t split_k, uint32_t batch, uint32_t ne02, uint32_t ne12, uint32_t broadcast2, uint32_t broadcast3,
-        uint32_t padded_n, uint32_t fusion_flags = 0, float fuse_scale_pre = 1.0f, float fuse_scale_post = 1.0f) {
+        uint32_t padded_n, uint32_t fusion_flags = 0, float fuse_scale_pre = 1.0f, float fuse_scale_post = 1.0f,
+        vk_subbuffer fmul = vk_subbuffer{}) {
         VK_LOG_DEBUG("ggml_vk_matmul(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
     if (split_k == 1) {
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
@@ -9604,7 +9607,8 @@ static void ggml_vk_matmul(
             uint32_t groups_z = std::min(batch - base_work_group_z, ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
 
             const vk_mat_mat_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k, ne02, ne12, broadcast2, broadcast3, padded_n, fusion_flags, fuse_scale_pre, fuse_scale_post };
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d }, pc, { m, n, groups_z });
+            // binding 3 (fused MUL operand) is part of the layout; bind d as the dummy when unused
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, fmul.buffer != nullptr ? fmul : d }, pc, { m, n, groups_z });
             base_work_group_z += groups_z;
         }
         return;
@@ -9629,7 +9633,7 @@ static void ggml_vk_matmul(
         GGML_ASSERT(fusion_flags == 0 && "fused mm tile epilog requires split_k == 1");
         const vk_mat_mat_push_constants pc1 = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k_split, ne02, ne12, broadcast2, broadcast3, padded_n, 0, 1.0f, 1.0f };
         // Make sure enough workgroups get assigned for split k to work
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, split_k_buffer }, pc1, { (CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0]) * split_k, n, groups_z });
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, split_k_buffer, d }, pc1, { (CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0]) * split_k, n, groups_z });
         base_work_group_z += groups_z;
     }
     ggml_vk_sync_buffers(ctx, subctx);
@@ -10073,9 +10077,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint32_t mm_fusion_flags    = ctx->fused_mm_tile_flags;
     const float    mm_fuse_scale_pre  = ctx->fused_mm_tile_scale_pre;
     const float    mm_fuse_scale_post = ctx->fused_mm_tile_scale_post;
+    const ggml_tensor * mm_fusion_mul = ctx->fused_mm_tile_mul;
     ctx->fused_mm_tile_flags = 0;
     ctx->fused_mm_tile_scale_pre = 1.0f;
     ctx->fused_mm_tile_scale_post = 1.0f;
+    ctx->fused_mm_tile_mul = nullptr;
 
     const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || mm_fusion_flags != 0, pipeline);
 
@@ -10239,7 +10245,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ne01, ne11, ne10,
         ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
         split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
-        mm_fusion_flags, mm_fuse_scale_pre, mm_fuse_scale_post
+        mm_fusion_flags, mm_fuse_scale_pre, mm_fuse_scale_post,
+        (mm_fusion_flags & MM_TILE_FUSION_MUL) ? ggml_vk_tensor_subbuffer(ctx, mm_fusion_mul) : vk_subbuffer{}
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -10931,14 +10938,18 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
                 const ggml_tensor * n = cgraph->nodes[node_idx + k];
                 if (n->op == GGML_OP_SCALE) {
                     (unary_seen ? scale_post : scale_pre) = ggml_get_op_params_f32(n, 0);
+                } else if (n->op == GGML_OP_MUL) {
+                    const ggml_tensor * prev = cgraph->nodes[node_idx + k - 1];
+                    ctx->fused_mm_tile_mul = n->src[0] == prev ? n->src[1] : n->src[0];
+                    flags |= MM_TILE_FUSION_MUL;
                 } else {
                     GGML_ASSERT(n->op == GGML_OP_UNARY);
-                    flags = ggml_get_unary_op(n) == GGML_UNARY_OP_SIGMOID ? MM_TILE_FUSION_SIGMOID
-                                                                          : MM_TILE_FUSION_SILU;
+                    flags |= ggml_get_unary_op(n) == GGML_UNARY_OP_SIGMOID ? MM_TILE_FUSION_SIGMOID
+                                                                           : MM_TILE_FUSION_SILU;
                     unary_seen = true;
                 }
             }
-            GGML_ASSERT(unary_seen);
+            GGML_ASSERT(unary_seen || (flags & MM_TILE_FUSION_MUL));
             ctx->fused_mm_tile_flags = flags;
             ctx->fused_mm_tile_scale_pre = scale_pre;
             ctx->fused_mm_tile_scale_post = scale_post;
@@ -10947,8 +10958,9 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
             static bool epilog_logged = false;
             if (!epilog_logged) {
                 epilog_logged = true;
-                fprintf(stderr, "ggml_vulkan: mm tile epilog fusion engaged (first: %s m=%lld n=%lld)\n",
-                        flags == MM_TILE_FUSION_SIGMOID ? "sigmoid" : "silu",
+                fprintf(stderr, "ggml_vulkan: mm tile epilog fusion engaged (first: %s%s m=%lld n=%lld)\n",
+                        (flags & MM_TILE_FUSION_SILU) ? "silu" : (flags & MM_TILE_FUSION_SIGMOID) ? "sigmoid" : "",
+                        (flags & MM_TILE_FUSION_MUL) ? "+mul" : "",
                         (long long) src0->ne[1], (long long) dst->ne[1]);
             }
         }
@@ -18757,18 +18769,23 @@ static bool ggml_vk_can_fuse_mm_tile_epilog(const ggml_backend_vk_context * ctx,
         return false;
     }
 
-    enum ggml_op ops[4];
+    enum ggml_op ops[5];
     ops[0] = GGML_OP_MUL_MAT;
+
+    // =2 keeps phase A only (no trailing MUL), for A/B isolation
+    const bool allow_mul = !(env && atoi(env) == 2);
 
     bool scale_pre  = false;
     bool scale_post = false;
     bool unary_seen = false;
+    bool mul_seen   = false;
     for (int k = 1; k <= num_extra; ++k) {
-        const ggml_tensor * n = cgraph->nodes[node_idx + k];
+        const ggml_tensor * n    = cgraph->nodes[node_idx + k];
+        const ggml_tensor * prev = cgraph->nodes[node_idx + k - 1];
         ops[k] = n->op;
         switch (n->op) {
         case GGML_OP_SCALE:
-            if (unary_seen ? scale_post : scale_pre) {
+            if (mul_seen || (unary_seen ? scale_post : scale_pre)) {
                 return false;
             }
             // scale with bias isn't handled
@@ -18778,7 +18795,7 @@ static bool ggml_vk_can_fuse_mm_tile_epilog(const ggml_backend_vk_context * ctx,
             (unary_seen ? scale_post : scale_pre) = true;
             break;
         case GGML_OP_UNARY:
-            if (unary_seen) {
+            if (mul_seen || unary_seen) {
                 return false;
             }
             if (ggml_get_unary_op(n) != GGML_UNARY_OP_SILU &&
@@ -18787,6 +18804,24 @@ static bool ggml_vk_can_fuse_mm_tile_epilog(const ggml_backend_vk_context * ctx,
             }
             unary_seen = true;
             break;
+        case GGML_OP_MUL: {
+            if (!allow_mul || mul_seen) {
+                return false;
+            }
+            if (n->src[0] != prev && n->src[1] != prev) {
+                return false;
+            }
+            const ggml_tensor * other = n->src[0] == prev ? n->src[1] : n->src[0];
+            // the store reuses the D indexing for the mul operand
+            if (other->type != GGML_TYPE_F32 ||
+                !ggml_are_same_shape(n, other) ||
+                !ggml_are_same_stride(n, other) ||
+                get_misalign_bytes(ctx, other) != 0) {
+                return false;
+            }
+            mul_seen = true;
+            break;
+        }
         default:
             return false;
         }
@@ -18794,8 +18829,8 @@ static bool ggml_vk_can_fuse_mm_tile_epilog(const ggml_backend_vk_context * ctx,
             return false;
         }
     }
-    // a bare scale chain without the unary op isn't worth consuming nodes for
-    if (!unary_seen) {
+    // a bare scale chain without a unary op or mul isn't worth consuming nodes for
+    if (!unary_seen && !mul_seen) {
         return false;
     }
 
@@ -19580,6 +19615,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_mm_tile_epilog(ctx, cgraph, i, 4)) {
+                ctx->num_additional_fused_ops = 4;
+                fusion_string = "MM_TILE_EPILOG";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = true;
+                op_srcs_fused_elementwise[2] = true;
+                op_srcs_fused_elementwise[3] = true;
+                op_srcs_fused_elementwise[4] = true;
             } else if (ggml_vk_can_fuse_mm_tile_epilog(ctx, cgraph, i, 3)) {
                 ctx->num_additional_fused_ops = 3;
                 fusion_string = "MM_TILE_EPILOG";

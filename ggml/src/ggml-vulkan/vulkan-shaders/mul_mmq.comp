@@ -32,6 +32,11 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 #endif
 layout (binding = 1) readonly buffer B {block_q8_1_x4_packed128 data_b[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+#ifndef MUL_MAT_ID
+// [MM_TILE_EPILOG] operand of a fused trailing MUL. Always bound (dummy when
+// unused); read only when fusion_flags bit 2 is set. Same shape/stride as D.
+layout (binding = 3) readonly buffer FMUL {float data_fmul[];};
+#endif
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
@@ -320,14 +325,20 @@ void main() {
 #else
                     if (dr_warp + cr < p.M && dc_warp + cc < p.N) {
                         float fv = float(sums[sums_idx].x);
-                        // [MM_TILE_EPILOG] fused [scale] sigmoid|silu [scale]
+                        const uint didx = offsets + (dc_warp + cc) * p.stride_d + dr_warp + cr;
+                        // [MM_TILE_EPILOG] fused [scale] sigmoid|silu [scale] [mul]
                         if (p.fusion_flags != 0u) {
                             fv *= p.fuse_scale_pre;
-                            const float sig = 1.0f / (1.0f + exp(-fv));
-                            fv = ((p.fusion_flags & 2u) != 0u) ? fv * sig : sig;
+                            if ((p.fusion_flags & 3u) != 0u) {
+                                const float sig = 1.0f / (1.0f + exp(-fv));
+                                fv = ((p.fusion_flags & 2u) != 0u) ? fv * sig : sig;
+                            }
                             fv *= p.fuse_scale_post;
+                            if ((p.fusion_flags & 4u) != 0u) {
+                                fv *= data_fmul[didx];
+                            }
                         }
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + cr] = D_TYPE(fv);
+                        data_d[didx] = D_TYPE(fv);
                     }
 #endif // MUL_MAT_ID
                 }
