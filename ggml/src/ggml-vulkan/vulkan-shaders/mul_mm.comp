@@ -94,6 +94,9 @@ layout (push_constant) uniform parameter
     uint padded_N;
     uint use_row_lists;
     uint fusion_flags;
+    // [MMID_COMPACT] 0 = z-slice-per-expert dispatch; else the index (in the counts buffer)
+    // of a live-tile list, and WorkGroupID.y indexes (expert << 16 | tile) entries
+    uint tile_list_base;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -161,13 +164,32 @@ shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #include "mul_mm_funcs.glsl"
 
 void main() {
-    const uint ic = gl_WorkGroupID.y;
-
 #ifdef MUL_MAT_ID
-    const uint expert_idx = gl_WorkGroupID.z;
-    if (ic * BN >= data_expert_count[expert_idx]) {
-        return;
+    // [MMID_COMPACT] with a tile list the grid is flat over live (expert, tile) pairs, so the
+    // ~97% of z-slice workgroups whose tile lies past their expert's row count never launch.
+    // n_as is recovered from the list base (it sits after [counts][offsets][cursors][entries]).
+    uint ic_v, expert_idx_v, n_as_v;
+    if (p.tile_list_base != 0) {
+        n_as_v = (p.tile_list_base - 1 - p.nei0 * p.nei1) / 3;
+        const int tl = data_expert_count[p.tile_list_base + gl_WorkGroupID.y];
+        if (tl < 0) {
+            return;
+        }
+        expert_idx_v = uint(tl) >> 16;
+        ic_v = uint(tl) & 0xffffu;
+    } else {
+        n_as_v = gl_NumWorkGroups.z;
+        ic_v = gl_WorkGroupID.y;
+        expert_idx_v = gl_WorkGroupID.z;
+        if (ic_v * BN >= data_expert_count[expert_idx_v]) {
+            return;
+        }
     }
+    const uint ic = ic_v;
+    const uint expert_idx = expert_idx_v;
+    const uint mmid_n_as = n_as_v;
+#else
+    const uint ic = gl_WorkGroupID.y;
 #endif
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
@@ -236,7 +258,7 @@ void main() {
 
 #ifdef MUL_MAT_ID
     if (p.use_row_lists != 0) {
-        load_row_ids_from_lists(expert_idx, ic);
+        load_row_ids_from_lists(mmid_n_as, expert_idx, ic);
     } else {
 #ifdef MUL_MAT_ID_USE_SUBGROUPS
     if (bitCount(p.nei0) == 1) {

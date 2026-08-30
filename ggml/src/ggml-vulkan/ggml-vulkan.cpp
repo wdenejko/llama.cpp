@@ -1362,6 +1362,9 @@ struct vk_mat_mat_id_push_constants {
     uint32_t padded_N;
     uint32_t use_row_lists;
     uint32_t fusion_flags;
+    // [MMID_COMPACT] 0 = z-slice-per-expert dispatch; else index of the live-tile list
+    // in the expert-counts buffer (see mmid_row_lists.comp)
+    uint32_t tile_list_base;
 };
 struct vk_mat_vec_id_push_constants {
     uint32_t ncols;
@@ -9585,14 +9588,23 @@ static void ggml_vk_matmul_id(
         uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t n_as, uint32_t nei0, uint32_t nei1, uint32_t nbi1, uint32_t ne11,
-        uint32_t padded_n, uint32_t use_row_lists, const vk_subbuffer & fused_scale, uint32_t fusion_flags) {
+        uint32_t padded_n, uint32_t use_row_lists, const vk_subbuffer & fused_scale, uint32_t fusion_flags,
+        uint32_t tile_list_base, uint32_t bound_tiles) {
     VK_LOG_DEBUG("ggml_vk_matmul_id(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), ids: (" << ids.buffer->buffer << ", " << ids.offset << ", " << ids.size << "), expert_count: (" << expert_count_buf.buffer->buffer << ", " << expert_count_buf.offset << ", " << expert_count_buf.size << "), " <<
         "m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", " <<
         "batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", " <<
         "n_as: " << n_as << ", nei0: " << nei0 << ", nei1: " << nei1 << ", nbi1: " << nbi1 << ", ne11: " << ne11 << ")");
     const vk_mat_mat_id_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d,
-                                              nei0, nei1, nbi1, ne11, padded_n, use_row_lists, fusion_flags };
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale }, pc, { m, nei1, n_as });
+                                              nei0, nei1, nbi1, ne11, padded_n, use_row_lists, fusion_flags, tile_list_base };
+    if (tile_list_base != 0) {
+        // [MMID_COMPACT] flat grid over the live (expert, tile) list: ~sum(ceil(count_e/BN))
+        // workgroups instead of ceil(nei1/BN) * n_as, of which ~97% exit immediately at
+        // MoE prefill's small per-expert n
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale }, pc,
+                { m, bound_tiles * pipeline->wg_denoms[1], 1 });
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ids, expert_count_buf, fused_scale }, pc, { m, nei1, n_as });
+    }
 }
 
 static bool ggml_vk_dim01_contiguous(const ggml_tensor * tensor) {
@@ -11026,9 +11038,23 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     static const char * mmid_row_lists_env = getenv("GGML_VK_MMID_ROWLISTS");
     const bool use_row_lists = !(mmid_row_lists_env && atoi(mmid_row_lists_env) == 0) && !ctx->device->coopmat2;
 
+    // EXPERIMENT (GGML_VK_MMID_COMPACT=1): dispatch the matmul over a prepass-built list of
+    // live (expert, tile) pairs instead of one z-slice per expert. At MoE prefill (n_as=512,
+    // ~40 rows/expert, BN=64) the z-slice grid launches ~32x more workgroups than have any
+    // rows, and the dead launches are a large share of the node's runtime. Needs the row-list
+    // prepass (it builds the tile list) and the scalar/coopmat1 tile shader (mmq ignores the
+    // field, so quantize_y keeps the classic grid).
+    static const char * mmid_compact_env = getenv("GGML_VK_MMID_COMPACT");
+    const bool use_compact = (mmid_compact_env && atoi(mmid_compact_env) != 0) &&
+                             use_row_lists && !quantize_y;
+
+    const uint32_t compact_bn    = use_compact ? pipeline->wg_denoms[1] : 0;
+    const uint32_t bound_tiles   = use_compact ? (uint32_t)(n_as + CEIL_DIV(nei0 * nei1, compact_bn)) : 0;
+    const uint32_t tile_list_base = use_compact ? (uint32_t)(3 * n_as + 1 + nei0 * nei1) : 0;
+
     uint32_t expert_count_size = sizeof(uint32_t) * n_as;
     if (use_row_lists) {
-        expert_count_size = sizeof(uint32_t) * (uint32_t)(3 * n_as + 1 + nei0 * nei1);
+        expert_count_size = sizeof(uint32_t) * (uint32_t)(3 * n_as + 1 + nei0 * nei1 + bound_tiles);
     }
 
     {
@@ -11177,13 +11203,16 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     ggml_vk_sync_buffers(ctx, subctx);
 
     if (use_row_lists) {
-        // Prefix-sum the expert counts and scatter (ii0, ii1) into per-expert row lists
+        // Prefix-sum the expert counts and scatter (ii0, ii1) into per-expert row lists;
+        // under MMID_COMPACT the same pass also emits the live-tile list after the entries
         const std::vector<uint32_t> pc = { (uint32_t)nei0,
                                            (uint32_t)nei1,
                                            (uint32_t)(nbi0 / ggml_type_size(ids->type)),
                                            (uint32_t)(nbi1 / ggml_type_size(ids->type)),
                                            (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
-                                           (uint32_t)n_as };
+                                           (uint32_t)n_as,
+                                           compact_bn,
+                                           bound_tiles };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mmid_row_lists,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf }, pc, { 1, 1, 1});
         ggml_vk_sync_buffers(ctx, subctx);
@@ -11211,7 +11240,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         n_as, nei0, nei1, nbi1 / ggml_type_size(ids->type), ne11, padded_n,
         use_row_lists ? 1u : 0u,
         fused_scale ? ggml_vk_tensor_subbuffer(ctx, fused_scale) : vk_subbuffer{ d_D, d_buf_offset, d_sz },
-        fused_scale ? 1u : 0u
+        fused_scale ? 1u : 0u,
+        tile_list_base, bound_tiles
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {

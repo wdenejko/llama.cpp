@@ -23,6 +23,11 @@ layout (push_constant) uniform parameter
     uint nb01;
     uint a_offset;
     uint n_as;
+    // [MMID_COMPACT] bn != 0 also emits a live-tile list after the entries:
+    // one (expert << 16 | tile) word per ceil(count/bn) tile of each expert,
+    // padded to bound_tiles with -1 sentinels
+    uint bn;
+    uint bound_tiles;
 } p;
 
 #define BLOCK_SIZE 256
@@ -86,6 +91,46 @@ void main() {
         if (id >= 0 && uint(id) < p.n_as) {
             const uint slot = atomicAdd(data_rl[cur_base + uint(id)], 1);
             data_rl[ent_base + slot] = (ii1 << 16) | ii0;
+        }
+    }
+
+    // [MMID_COMPACT] emit the live-tile list: for each expert, one word per BN-wide tile of
+    // its rows, so the matmul can dispatch over live tiles instead of n_as z-slices
+    if (p.bn != 0) {
+        const uint tl_base = ent_base + num_elements;
+
+        if (tid == 0) {
+            sh_carry = 0;
+        }
+        barrier();
+        for (uint base = 0; base < p.n_as; base += BLOCK_SIZE) {
+            const uint i = base + tid;
+            const uint t = (i < p.n_as) ? (data_rl[i] + p.bn - 1) / p.bn : 0;
+            sh[tid] = t;
+            barrier();
+            [[unroll]] for (uint s = 1; s < BLOCK_SIZE; s <<= 1) {
+                const uint v = (tid >= s) ? sh[tid - s] : 0;
+                barrier();
+                sh[tid] += v;
+                barrier();
+            }
+            const uint carry = sh_carry;
+            if (i < p.n_as) {
+                const uint excl = carry + sh[tid] - t;
+                for (uint j = 0; j < t; ++j) {
+                    data_rl[tl_base + excl + j] = (i << 16) | j;
+                }
+            }
+            barrier();
+            if (tid == BLOCK_SIZE - 1) {
+                sh_carry = carry + sh[tid];
+            }
+            barrier();
+        }
+
+        // pad the rest with sentinels the matmul early-outs on
+        for (uint i = sh_carry + tid; i < p.bound_tiles; i += BLOCK_SIZE) {
+            data_rl[tl_base + i] = 0xffffffffu;
         }
     }
 }

@@ -5,9 +5,9 @@ uint _ne1;
 // Read this workgroup's row ids from the lists built by the mmid_row_lists
 // prepass, stored after the expert counts in the same buffer:
 // [counts n_as][offsets n_as+1][cursors n_as][entries packed (ii1 << 16) | ii0].
-// The dispatch uses one z-slice per expert, so n_as == gl_NumWorkGroups.z.
-void load_row_ids_from_lists(uint expert_idx, uint ic) {
-    const uint n_as = gl_NumWorkGroups.z;
+// n_as comes from the caller: the z-slice dispatch knows it as gl_NumWorkGroups.z,
+// the compact tile-list dispatch (grid.z == 1) derives it from the list base.
+void load_row_ids_from_lists(uint n_as, uint expert_idx, uint ic) {
     _ne1 = uint(data_expert_count[expert_idx]);
     const uint expert_off = uint(data_expert_count[n_as + expert_idx]);
     const uint ent_base = 3 * n_as + 1 + expert_off + ic * BN;
