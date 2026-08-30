@@ -63,7 +63,7 @@ VK_ENV=()
 # COOPMAT=0 is a global kill switch forcing KHR_coopmat OFF (regression fallback). Default is ON.
 [ "$COOPMAT" = "0" ] && VK_ENV=(GGML_VK_DISABLE_COOPMAT=1)
 # pass experiment env vars into the toolbox (toolbox run does not forward the host env)
-for _v in GGML_TOPK_LOG Q4X_QSA_BLK_TOPK GGML_VK_EVENT_DEVICE_WAIT GGML_VK_EVENT_TL_OFF; do
+for _v in GGML_TOPK_LOG GGML_VK_EVENT_DEVICE_WAIT GGML_VK_EVENT_TL_OFF; do
   if [ -n "${!_v:-}" ]; then VK_ENV+=("$_v=${!_v}"); fi
 done
 # Q4X_RS_ROLLBACK: enable qwen4exp recurrent partial rollback (n_rs_seq=4). Without it every
@@ -72,6 +72,11 @@ done
 # Validated 2026-08-29: 10/10 harness tasks, 0 restores, stall task 62s->7s. RSROLL=0 disables
 # (the server-side non-convergence guard then covers the livelock, at checkpoint-churn cost).
 [ "${RSROLL:-1}" != "0" ] && VK_ENV+=(Q4X_RS_ROLLBACK=1)
+# Q4X_QSA_BLK_TOPK: block-level QSA indexer top-k. A/B 2026-08-30 (symmetric, 98k ctx): pp +25%
+# and tg +11% at 32-64k depth, pp +5% shallow, ~2GB less GTT at full ctx, needle retrieval
+# intact at 32k/64k, harness 10/10 — and the k=2051 CPU top_k fallback disappears (~14k
+# dispatches/run -> 0). Costs ~3pt draft acceptance (net tg still ahead). BLKTOPK=0 disables.
+[ "${BLKTOPK:-1}" != "0" ] && VK_ENV+=(Q4X_QSA_BLK_TOPK=1)
 if [ "$MTP" = "1" ]; then
   # draft-mtp ONLY. Do NOT add ngram-mod (its 48-64 tok drafts regress acceptance here).
   # p-min 0.75 gates low-confidence drafts (keeps prose from regressing).
