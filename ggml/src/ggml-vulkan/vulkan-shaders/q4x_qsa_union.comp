@@ -1,5 +1,7 @@
 #version 450
 
+#extension GL_EXT_control_flow_attributes : require
+
 // qwen4exp gathered sparse prefill, step 1 (mirrors ggml_compute_forward_q4x_qsa_union):
 // bitmap-dedup union of the QSA indexer's selected KV cells across one tile of
 // nt query tokens. src0 = top_k I32 [n_sel, nt] (strided rows), dst = I32 [c_max+1]:
