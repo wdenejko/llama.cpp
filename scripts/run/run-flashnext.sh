@@ -66,7 +66,8 @@ VK_ENV=()
 # COOPMAT=0 is a global kill switch forcing KHR_coopmat OFF (regression fallback). Default is ON.
 [ "$COOPMAT" = "0" ] && VK_ENV=(GGML_VK_DISABLE_COOPMAT=1)
 # pass experiment env vars into the toolbox (toolbox run does not forward the host env)
-for _v in GGML_TOPK_LOG GGML_VK_EVENT_DEVICE_WAIT GGML_VK_EVENT_TL_OFF GGML_VK_DISABLE_FUSION GGML_VK_PERF_LOGGER GGML_VK_DENSE_F16B GGML_VK_DENSE_WAVE32 RADV_PERFTEST Q4X_SPEC_STOCH_TOPK Q4X_SPEC_STOCH_TEMP; do
+for _v in GGML_TOPK_LOG GGML_VK_EVENT_DEVICE_WAIT GGML_VK_EVENT_TL_OFF GGML_VK_DISABLE_FUSION GGML_VK_PERF_LOGGER GGML_VK_DENSE_F16B GGML_VK_DENSE_WAVE32 RADV_PERFTEST \
+             GGML_VK_MMID_INT GGML_VK_MMID_F16B GGML_VK_MMID_SCALE_EPILOGUE GGML_VK_MMID_PROBE Q4X_SPEC_STOCH_TOPK Q4X_SPEC_STOCH_TEMP; do
   if [ -n "${!_v:-}" ]; then VK_ENV+=("$_v=${!_v}"); fi
 done
 # Q4X_RS_ROLLBACK: qwen4exp recurrent partial rollback (n_rs_seq=4). DEFAULT ON since the
