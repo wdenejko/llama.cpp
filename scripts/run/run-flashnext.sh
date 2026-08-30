@@ -97,7 +97,10 @@ if [ "$MTP" = "1" ]; then
   # is within 6.5% of ub2048 anyway: 141.5 vs 150.7).
   PMIN="${PMIN:-0.75}"  # draft confidence gate; tuned for greedy drafting — with SPEC_STOCH at
                         # temp>0 the draft's max-prob is flatter, so a lower PMIN drafts deeper
-  MTP_ARGS=(-md "$MD" --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min "$PMIN"
+  NMAX="${NMAX:-4}"     # draft depth. NB the Vulkan mat-vec shaders batch at most 8 columns, so
+                        # keep NMAX+1 <= 8 or every verify matmul falls off a ~2.7x cliff
+                        # (apepojken fork measurement); 6 was their sweet spot at ~0.9 accept
+  MTP_ARGS=(-md "$MD" --spec-type draft-mtp --spec-draft-n-max "$NMAX" --spec-draft-p-min "$PMIN"
             --spec-draft-ubatch "$UBD" --spec-draft-type-k "$KVD" --spec-draft-type-v "$KVD")
   # Q4X_SPEC_STOCH: stochastic speculative sampling — the draft SAMPLES with the target's
   # sampling params and the server verifies by rejection sampling (lossless for the target

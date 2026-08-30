@@ -1340,7 +1340,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+    // cont the transposed activations before the concat: concat's non-contiguous path costs
+    // ~13ms per GDN layer on 2048-token prefill chunks (~463ms per chunk over 36 layers,
+    // measured on gfx1151 by the apepojken fork - +8% prefill at every depth from this line)
+    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_cont(ctx0, ggml_transpose(ctx0, x)), 0);
 
     // keep the last state_cols columns for the next ubatch
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
