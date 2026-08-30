@@ -523,10 +523,12 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         bool blk_topk,
         ggml_tensor * dirty_cells,
         ggml_tensor * dirty_pos,
-        ggml_tensor * dirty_rows) const {
+        ggml_tensor * dirty_rows,
+        ggml_tensor * blk_slot_bias) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
     GGML_ASSERT(!blk_topk || (blk_bias && blk_cells_dup != nullptr));
+    GGML_ASSERT(blk_slot_bias == nullptr || blk_topk);
 
     // [TAG_QSA_POOLED_CACHE] all three dirty tensors travel together
     GGML_ASSERT((dirty_cells != nullptr) == (dirty_rows != nullptr));
@@ -591,6 +593,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         int32_t * cur_cell_blk  = dst_cell_blk  ? dst_cell_blk  + s*n_kv          : nullptr;
         int32_t * cur_blk_cells = dst_blk_cells ? dst_blk_cells + s*(r*n_blocks)  : loc_blk_cells.data();
         int32_t * cur_dup       = blk_topk ? (int32_t *) blk_cells_dup->data + s*(r*n_blocks) : nullptr;
+        float   * cur_slot_bias = blk_slot_bias ? (float *) blk_slot_bias->data + s*(r*n_blocks) : nullptr;
 
         // an incomplete block cannot be pooled; the bias below forces those tail cells in
         // -1 means no usable block, and block 0 only keeps the gather in range
@@ -642,6 +645,9 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 for (int64_t t = 0; t < r; ++t) {
                     cur_dup[b*r + t] = slot_set[b*r + t] ? cur_blk_cells[b*r + t]
                                      : (first_cell[b] >= 0 ? first_cell[b] : 0);
+                    if (cur_slot_bias != nullptr) {
+                        cur_slot_bias[b*r + t] = slot_set[b*r + t] ? 0.0f : -INFINITY;
+                    }
                 }
             }
         }

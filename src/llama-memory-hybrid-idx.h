@@ -195,12 +195,16 @@ public:
     //   dirty_pos   I32 [4*n_dirty]    mrope rows of each such block's first token
     //   dirty_rows  I64 [n_dirty]      store row per block; unused slots aim at the dustbin
     // filling them also advances the owner's watermark
+    // [TAG_QSA_GATHER] blk_slot_bias (with blk_topk) asks for per-slot validity: 0.0 where a
+    // block slot holds its own cell, -inf where blk_cells_dup repeated one, so a gathered
+    // softmax counts each cell once
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_cells_dup,
                        ggml_tensor * blk_pos, ggml_tensor * bias, const llama_ubatch * ubatch,
                        uint32_t ratio, bool blk_bias, bool blk_topk,
-                       ggml_tensor * dirty_cells = nullptr,
-                       ggml_tensor * dirty_pos   = nullptr,
-                       ggml_tensor * dirty_rows  = nullptr) const;
+                       ggml_tensor * dirty_cells   = nullptr,
+                       ggml_tensor * dirty_pos     = nullptr,
+                       ggml_tensor * dirty_rows    = nullptr,
+                       ggml_tensor * blk_slot_bias = nullptr) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
