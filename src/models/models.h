@@ -2345,6 +2345,22 @@ struct llama_model_qwen4exp : public llama_model_base {
                           float   kq_scale,
                             int   il);
 
+        // [TAG_QSA_GP] gathered sparse PREFILL: per W-token tile, dedup the tile's top-k
+        // selections into one cell list, gather those K/V rows and the sparse mask, and run
+        // dense flash attention over the C gathered cells instead of streaming the whole
+        // cache. Math-equal to the masked-dense path: the mask is gathered from the same
+        // sparse kq_mask_top_k, so per-token visibility is unchanged.
+        ggml_tensor * build_attn_qsa_gather_prefill(
+                    ggml_tensor * k,
+                    ggml_tensor * v,
+                    ggml_tensor * kq_mask_sparse,
+                    ggml_tensor * q_cur,
+            const qsa_selection & sel,
+                        int64_t   W,
+                        int64_t   C,
+                          float   kq_scale,
+                            int   il);
+
         // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;

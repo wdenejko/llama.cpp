@@ -88,6 +88,14 @@ done
 # masked-dense wins at every depth - 47.0 vs 46.1 tg @32k, 45.3 vs 37.2 @48k; identity is
 # byte-equal, so this is purely a perf call). GATHER=N re-enables from N cells (1 = always).
 [ -n "${GATHER:-}" ] && VK_ENV+=(Q4X_QSA_GATHER="$GATHER")
+# Q4X_QSA_GP: gathered sparse PREFILL - per 128-token tile, dedup the top-k selections and
+# run FA over the gathered union (~45-50% of n_kv at 32k) instead of streaming the whole
+# cache. Math-equal to masked-dense (mask gathered from the same sparse mask). OFF by
+# default pending A/B; GP=N engages from n_kv >= N (try GP=24576). GP_W tile width,
+# GP_FRAC gathered-list capacity as a fraction of n_kv (union overflow drops cells).
+[ -n "${GP:-}" ]      && VK_ENV+=(Q4X_QSA_GP="$GP")
+[ -n "${GP_W:-}" ]    && VK_ENV+=(Q4X_QSA_GP_W="$GP_W")
+[ -n "${GP_FRAC:-}" ] && VK_ENV+=(Q4X_QSA_GP_FRAC="$GP_FRAC")
 # POOLED=0 disables the QSA pooled-key summary cache (default on in the binary; this is the
 # recompute-every-graph fallback for A/B and debugging).
 [ "${POOLED:-1}" = "0" ] && VK_ENV+=(LLAMA_QSA_NO_POOLED_CACHE=1)

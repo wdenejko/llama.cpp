@@ -1090,6 +1090,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_q4x_hc_combine_f32;
+    vk_pipeline pipeline_q4x_qsa_union;
+    vk_pipeline pipeline_q4x_qsa_mask_gather;
+    vk_pipeline pipeline_q4x_qsa_kv_gather;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1955,6 +1958,16 @@ struct vk_op_dsv4_hc_post_push_constants {
     uint32_t sd0, sd1, sd2;
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
+
+struct vk_op_q4x_qsa_union_push_constants {
+    uint32_t n_sel, nt, nbt1, n_kv, c_max;
+};
+struct vk_op_q4x_qsa_mask_gather_push_constants {
+    uint32_t c_max, nt, n_kv, sm1, sd1;
+};
+struct vk_op_q4x_qsa_kv_gather_push_constants {
+    uint32_t row_sz, c_max, n_rows, ss1;
+};
 
 struct vk_op_q4x_hc_combine_push_constants {
     uint32_t n_embd, hc, nr;
@@ -6632,6 +6645,15 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_q4x_hc_combine_f32,
         "q4x_hc_combine_f32", q4x_hc_combine_f32_len, q4x_hc_combine_f32_data, "main", 4,
         sizeof(vk_op_q4x_hc_combine_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_q4x_qsa_union,
+        "q4x_qsa_union", q4x_qsa_union_len, q4x_qsa_union_data, "main", 2,
+        sizeof(vk_op_q4x_qsa_union_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_q4x_qsa_mask_gather,
+        "q4x_qsa_mask_gather", q4x_qsa_mask_gather_len, q4x_qsa_mask_gather_data, "main", 3,
+        sizeof(vk_op_q4x_qsa_mask_gather_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_q4x_qsa_kv_gather,
+        "q4x_qsa_kv_gather", q4x_qsa_kv_gather_len, q4x_qsa_kv_gather_data, "main", 3,
+        sizeof(vk_op_q4x_qsa_kv_gather_push_constants), {512, 1, 1}, {}, 1);
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size}, 1, true, true);
@@ -14877,6 +14899,65 @@ static void ggml_vk_q4x_hc_combine(ggml_backend_vk_context * ctx, vk_context& su
         pc, {nr, 1, 1});
 }
 
+static void ggml_vk_q4x_qsa_union(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * top_k = dst->src[0];
+
+    const vk_op_q4x_qsa_union_push_constants pc = {
+        (uint32_t) top_k->ne[0], (uint32_t) top_k->ne[1],
+        (uint32_t) (top_k->nb[1] / sizeof(int32_t)),
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+        (uint32_t) ggml_get_op_params_i32(dst, 1),
+    };
+
+    vk_pipeline pipeline = ctx->device->pipeline_q4x_qsa_union;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, top_k), ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, {1, 1, 1});
+}
+
+static void ggml_vk_q4x_qsa_mask_gather(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * mask = dst->src[0];
+    const ggml_tensor * list = dst->src[1];
+
+    const uint32_t c_max = (uint32_t) dst->ne[0];
+    const uint32_t nt    = (uint32_t) dst->ne[1];
+
+    const vk_op_q4x_qsa_mask_gather_push_constants pc = {
+        c_max, nt, (uint32_t) mask->ne[0],
+        (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
+        (uint32_t) (dst->nb[1]  / sizeof(ggml_fp16_t)),
+    };
+
+    vk_pipeline pipeline = ctx->device->pipeline_q4x_qsa_mask_gather;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, mask), ggml_vk_tensor_subbuffer(ctx, list),
+         ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, {c_max * nt, 1, 1});
+}
+
+static void ggml_vk_q4x_qsa_kv_gather(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * rows = dst->src[0];
+    const ggml_tensor * list = dst->src[1];
+    GGML_UNUSED(list);
+
+    const uint32_t row_sz = (uint32_t) dst->ne[0];
+    const uint32_t c_max  = (uint32_t) dst->ne[1];
+
+    const vk_op_q4x_qsa_kv_gather_push_constants pc = {
+        row_sz, c_max, (uint32_t) rows->ne[1],
+        (uint32_t) (rows->nb[1] / sizeof(ggml_fp16_t)),
+    };
+
+    vk_pipeline pipeline = ctx->device->pipeline_q4x_qsa_kv_gather;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, rows), ggml_vk_tensor_subbuffer(ctx, dst->src[1]),
+         ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, {row_sz * c_max, 1, 1});
+}
+
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -17884,6 +17965,21 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     case GGML_OP_Q4X_HC_COMBINE:
         ggml_vk_q4x_hc_combine(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_Q4X_QSA_UNION:
+        ggml_vk_q4x_qsa_union(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_Q4X_QSA_MASK_GATHER:
+        ggml_vk_q4x_qsa_mask_gather(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_Q4X_QSA_KV_GATHER:
+        ggml_vk_q4x_qsa_kv_gather(ctx, compute_ctx, node);
 
         break;
 
@@ -21039,6 +21135,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_Q4X_HC_COMBINE:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_Q4X_QSA_UNION:
+            // the shader bitmap covers 262144 cells
+            return op->src[0]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32 &&
+                ggml_get_op_params_i32((ggml_tensor *) op, 0) <= 262144;
+        case GGML_OP_Q4X_QSA_MASK_GATHER:
+            return op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_F16;
+        case GGML_OP_Q4X_QSA_KV_GATHER:
+            return op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_F16;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 const ggml_tensor * q = op->src[0];

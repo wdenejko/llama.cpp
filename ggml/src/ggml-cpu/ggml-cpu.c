@@ -2080,6 +2080,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_q4x_hc_combine(params, tensor);
             } break;
+        case GGML_OP_Q4X_QSA_UNION:
+            {
+                ggml_compute_forward_q4x_qsa_union(params, tensor);
+            } break;
+        case GGML_OP_Q4X_QSA_MASK_GATHER:
+            {
+                ggml_compute_forward_q4x_qsa_mask_gather(params, tensor);
+            } break;
+        case GGML_OP_Q4X_QSA_KV_GATHER:
+            {
+                ggml_compute_forward_q4x_qsa_kv_gather(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2266,6 +2278,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_Q4X_HC_COMBINE:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_Q4X_QSA_UNION:
+        case GGML_OP_Q4X_QSA_MASK_GATHER:
+        case GGML_OP_Q4X_QSA_KV_GATHER:
+            {
+                n_tasks = 1;
             } break;
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:

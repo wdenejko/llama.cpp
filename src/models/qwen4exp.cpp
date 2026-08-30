@@ -1178,6 +1178,97 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gather(
     return cur;
 }
 
+// [TAG_QSA_GP] gathered sparse prefill. At depth, masked-dense QSA prefill streams the
+// whole KV cache through flash attention to discard all but the selected cells. Tokens of
+// one tile share most of their selection (union of W=128 neighbours ~ 45-50% of n_kv at
+// 32k, measured), so per W-token tile: bitmap-union the tile's top-k lists into one
+// ascending cell list, gather those K/V rows f16->f16, gather each token's row of the
+// sparse mask (already -inf outside its own selection - per-token strictness survives the
+// union widening), and run standard FA over the C gathered cells.
+ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gather_prefill(
+        ggml_tensor *         k,
+        ggml_tensor *         v,
+        ggml_tensor *         kq_mask_sparse,
+        ggml_tensor *         q_cur,
+        const qsa_selection & sel,
+        int64_t               W,
+        int64_t               C,
+        float                 kq_scale,
+        int                   il) {
+    ggml_tensor * top_k = sel.top_k;
+
+    const int64_t n_sel = top_k->ne[0];
+    const int64_t n_tps = top_k->ne[1];
+
+    const int64_t d_k  = k->ne[0];
+    const int64_t hkv  = k->ne[1];
+    const int64_t n_kv = k->ne[2];
+    const int64_t d_v  = v->ne[0];
+
+    const int64_t n_head  = q_cur->ne[1];
+    const int64_t n_tiles = n_tps / W;
+
+    GGML_ASSERT(top_k->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(top_k));
+    GGML_ASSERT(kq_mask_sparse->type == GGML_TYPE_F16);
+    GGML_ASSERT(kq_mask_sparse->ne[1] >= n_tps);
+    GGML_ASSERT(n_tps % W == 0);
+
+    // a cache cell is one contiguous d*hkv row, so fold the heads away and gather per cell
+    ggml_tensor * k_rows = ggml_view_2d(ctx0, k, d_k*hkv, n_kv, k->nb[2], 0);
+    ggml_tensor * v_rows = ggml_view_2d(ctx0, v, d_v*hkv, n_kv, v->nb[2], 0);
+
+    const size_t row_k = ggml_row_size(GGML_TYPE_F16, d_k);
+    const size_t row_v = ggml_row_size(GGML_TYPE_F16, d_v);
+
+    ggml_tensor * out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_v*n_head, n_tps);
+
+    for (int64_t ti = 0; ti < n_tiles; ++ti) {
+        // union of the tile's selections; pads in top_k name real (lowest-scoring) cells
+        // and the bitmap dedups them, so the full n_sel width goes in
+        ggml_tensor * tk = ggml_view_2d(ctx0, top_k, n_sel, W, top_k->nb[1], ti*W*top_k->nb[1]);
+        ggml_tensor * list = ggml_q4x_qsa_union(ctx0, tk, (int32_t) n_kv, (int32_t) C);
+
+        // each token keeps its own sparse-mask row: union cells outside its selection
+        // stay -inf, list pads (cell 0) get -inf from the count guard
+        ggml_tensor * m_t = ggml_view_2d(ctx0, kq_mask_sparse, n_kv, W,
+                kq_mask_sparse->nb[1], ti*W*kq_mask_sparse->nb[1]);
+        ggml_tensor * m_g = ggml_q4x_qsa_mask_gather(ctx0, m_t, list);
+
+        ggml_tensor * k_sel = ggml_q4x_qsa_kv_gather(ctx0, k_rows, list);
+        ggml_tensor * v_sel = ggml_q4x_qsa_kv_gather(ctx0, v_rows, list);
+
+        // heads stay interleaved inside a row (nb2 < nb1), the same stride pattern the
+        // decode gather feeds FA
+        ggml_tensor * k_g = ggml_view_4d(ctx0, k_sel, d_k, C, hkv, 1,
+                row_k*hkv, row_k, row_k*hkv*C, 0);
+        ggml_tensor * v_g = ggml_view_4d(ctx0, v_sel, d_v, C, hkv, 1,
+                row_v*hkv, row_v, row_v*hkv*C, 0);
+
+        ggml_tensor * q_t = ggml_view_3d(ctx0, q_cur, d_k, n_head, W,
+                q_cur->nb[1], q_cur->nb[2], ti*W*q_cur->nb[2]);
+        ggml_tensor * q = ggml_permute(ctx0, q_t, 0, 2, 1, 3);   // [d_k, W, n_head, 1]
+
+        ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, k_g, v_g, m_g, kq_scale, hparams.f_max_alibi_bias,
+                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+
+        ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+
+        cur = ggml_reshape_2d(ctx0, cur, d_v*n_head, W);
+
+        // the tiles land in slices of one output tensor; expansion order keeps the
+        // copies ahead of the consumer on the single-backend graph
+        ggml_tensor * slice = ggml_view_2d(ctx0, out, d_v*n_head, W, out->nb[1], ti*W*out->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, cur, slice));
+    }
+
+    ggml_build_forward_expand(gf, out);
+    cb(out, "kqv_out_gp", il);
+
+    return out;
+}
+
 // Dense GQA self-attention restricted to the cells that top_k names.
 // The mask build below copies the MLA sparse path in llm_graph_context::build_attn.
 ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
@@ -1270,6 +1361,68 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
+
+    // [TAG_QSA_GP] gathered sparse prefill (see build_attn_qsa_gather_prefill).
+    // Q4X_QSA_GP: unset or <= 0 -> OFF; N -> engage from n_kv >= N (1 = always).
+    // Q4X_QSA_GP_W: tile width (default 128, multiple of 64). Q4X_QSA_GP_FRAC:
+    // gathered-list capacity as a fraction of n_kv (default 0.62; the tile union
+    // must fit or the highest cells get dropped - check depth with the topk dump).
+    {
+        static const int64_t gp_min_kv = [] {
+            const char * env = getenv("Q4X_QSA_GP");
+            if (env == nullptr) {
+                return (int64_t) 0;
+            }
+            const long long val = atoll(env);
+            return val <= 0 ? (int64_t) 0 : (int64_t) val;
+        }();
+        static const int64_t gp_w = [] {
+            const char * env = getenv("Q4X_QSA_GP_W");
+            const long long val = env ? atoll(env) : 128;
+            return (val >= 64 && val % 64 == 0) ? (int64_t) val : (int64_t) 128;
+        }();
+        static const double gp_frac = [] {
+            const char * env = getenv("Q4X_QSA_GP_FRAC");
+            const double val = env ? atof(env) : 0.62;
+            return (val > 0.0 && val <= 1.0) ? val : 0.62;
+        }();
+
+        const int64_t n_tps = top_k->ne[1];
+        const int64_t ns    = top_k->ne[3];
+        const int64_t n_kv  = mctx_cur->get_n_kv();
+
+        // prefill only (the decode gather above owns small batches); the union shader's
+        // bitmap covers 262144 cells
+        if (gp_min_kv > 0 && cparams.flash_attn && !hparams.use_alibi &&
+                n_tokens > 16 && ns == 1 && n_tps % gp_w == 0 &&
+                n_kv >= gp_min_kv && n_kv <= 262144) {
+            int64_t c_pad = (int64_t) (gp_frac*(double) n_kv);
+            c_pad = std::max<int64_t>(c_pad, 3*(int64_t) sel.width);
+            c_pad = std::min<int64_t>(c_pad, n_kv);
+            c_pad = GGML_PAD(c_pad, 256);
+
+            ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+            ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+            if (c_pad < n_kv && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) {
+                static bool logged = false;
+                if (!logged) {
+                    fprintf(stderr, "qwen4exp: QSA gathered prefill engaged (n_kv=%" PRId64 " C=%" PRId64 " W=%" PRId64 ")\n",
+                            n_kv, c_pad, gp_w);
+                    logged = true;
+                }
+
+                ggml_tensor * cur = build_attn_qsa_gather_prefill(k, v, kq_mask_top_k, q_cur, sel, gp_w, c_pad, kq_scale, il);
+
+                // the rotation is its own inverse, so undo it on the value side of the output
+                if (inp->self_v_rot) {
+                    cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+                }
+
+                return cur;
+            }
+        }
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
