@@ -1436,17 +1436,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
         smpls.resize(n_seq);
-        for (auto & s : smpls) {
+        for (uint32_t is = 0; is < n_seq; ++is) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
-            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
-            s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+            if (this->params.stoch) {
+                // sample from a chain shaped like the target's: q then overlaps p and the
+                // rejection-sampling verifier accepts at rate ~= sum min(p, q)
+                sparams.temp     = this->params.stoch_temp;
+                sparams.top_k    = this->params.stoch_top_k;
+                sparams.top_p    = this->params.stoch_top_p;
+                sparams.min_p    = this->params.stoch_min_p;
+                sparams.seed     = this->params.stoch_seed == LLAMA_DEFAULT_SEED
+                    ? LLAMA_DEFAULT_SEED : this->params.stoch_seed + is + 1;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K, COMMON_SAMPLER_TYPE_TOP_P,
+                                     COMMON_SAMPLER_TYPE_MIN_P, COMMON_SAMPLER_TYPE_TEMPERATURE };
+            } else {
+                sparams.top_k    = 10;
+                sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            }
+            smpls[is].reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
-        // offload draft sampling to the backend
+        // offload draft sampling to the backend (not with stochastic drafting - the verifier
+        // needs the CPU-side candidate distribution)
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
+        if (this->params.backend_sampling && !this->params.stoch) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1711,7 +1725,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                const llama_token sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -1723,7 +1737,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                // stochastic mode drafts the SAMPLED token (from the target-shaped chain) so the
+                // verifier can accept it via rejection sampling against the recorded distribution
+                const llama_token id = params.stoch ? sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1737,6 +1753,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
+
+                if (params.stoch && dp.dists != nullptr) {
+                    std::vector<common_speculative_cand> dist;
+                    dist.reserve(cur_p->size);
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        dist.push_back({ cur_p->data[k].id, cur_p->data[k].p });
+                    }
+                    dp.dists->push_back(std::move(dist));
+                }
 
                 result.push_back(id);
 
@@ -1789,6 +1814,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.dists != nullptr) {
+                    dp.dists->clear();
+                }
             }
         }
     }
@@ -2578,6 +2606,25 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+    // stochastic drafting: mirror the target's sampling params into the draft sampler so the
+    // verifier can accept via rejection sampling at temp > 0 (lossless; see common.h)
+    if (getenv("Q4X_SPEC_STOCH") != nullptr && params.sampling.temp > 0.0f) {
+        auto & d = params.speculative.draft;
+        d.stoch       = true;
+        d.stoch_temp  = params.sampling.temp;
+        d.stoch_top_k = params.sampling.top_k;
+        d.stoch_top_p = params.sampling.top_p;
+        d.stoch_min_p = params.sampling.min_p;
+        d.stoch_seed  = params.sampling.seed;
+        // efficiency-only tuning knobs (correctness never depends on q's shape - the verifier
+        // uses the recorded distribution): a sharper draft chain keeps a weakly-calibrated
+        // head from sampling tail tokens the target will reject
+        if (const char * s = getenv("Q4X_SPEC_STOCH_TOPK")) { d.stoch_top_k = atoi(s); }
+        if (const char * s = getenv("Q4X_SPEC_STOCH_TEMP")) { d.stoch_temp  = (float) atof(s); }
+        LOG_INF("%s: stochastic speculative sampling enabled (temp=%.2f top_k=%d top_p=%.2f min_p=%.2f)\n",
+                __func__, d.stoch_temp, d.stoch_top_k, d.stoch_top_p, d.stoch_min_p);
+    }
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);

@@ -50,6 +50,15 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+// one candidate of a draft token's sampling distribution (the drafter's truncated, normalized set)
+struct common_speculative_cand {
+    llama_token id;
+    float       p;
+};
+
+// per drafted token: the distribution it was sampled from, aligned with the draft result
+using common_speculative_dists = std::vector<std::vector<common_speculative_cand>>;
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it
@@ -69,6 +78,12 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // when set and the drafter runs in stochastic mode, receives per drafted token the
+    // distribution it was sampled from (needed for lossless rejection-sampling verification);
+    // implementations that do not support it leave it empty and the caller falls back to
+    // exact-match verification
+    common_speculative_dists * dists = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

@@ -333,6 +333,19 @@ struct common_params_speculative_draft {
 
     bool adaptive = false; // adaptive draft length: size from recent acceptance, within [n_min, n_max]
 
+    // stochastic drafting for temp>0 speculative sampling: the drafter samples from a chain
+    // mirroring the target's sampling params (instead of taking its argmax) and reports each
+    // drafted token's candidate distribution, so the verifier can run lossless rejection
+    // sampling (accept w.p. min(1, p_tgt/q_dft)). exact-match verification collapses at
+    // temp>0 (accept rate = p(token)); this recovers rate ~= sum min(p, q).
+    // configured by common_speculative_init_result from the target sampling params.
+    bool     stoch       = false;
+    float    stoch_temp  = 1.0f;
+    int32_t  stoch_top_k = 40;
+    float    stoch_top_p = 0.95f;
+    float    stoch_min_p = 0.0f;
+    uint32_t stoch_seed  = 0;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

@@ -96,6 +96,88 @@ static std::vector<llama_token> server_sample_and_accept_synth(
     return result;
 }
 
+// stochastic speculative verification (Leviathan et al.): the draft token was SAMPLED from a
+// recorded distribution q; accept it with probability min(1, p/q) where p is the target's
+// post-chain probability, and on rejection sample the correction from the residual
+// max(0, p - q) renormalized. this preserves the target sampling distribution exactly while
+// accepting at rate ~= sum min(p, q) - where exact-match verification at temp > 0 only
+// accepts at rate p(token) and makes speculation a wash.
+static std::vector<llama_token> server_sample_and_accept_stoch(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft,
+        const common_speculative_dists & dists,
+        std::mt19937 & rng) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+    GGML_ASSERT(dists.size() >= draft.size());
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+
+    for (size_t i = 0; i < draft.size(); ++i) {
+        // applies the full target chain (reasoning budget + samplers); the chain's own pick is
+        // ignored - the candidate probabilities are what rejection sampling needs
+        common_sampler_sample(smpl, ctx, idxs[i]);
+        const auto * cur_p = common_sampler_get_candidates(smpl, true);
+
+        double p_d = 0.0;
+        for (size_t j = 0; j < cur_p->size; ++j) {
+            if (cur_p->data[j].id == draft[i]) { p_d = cur_p->data[j].p; break; }
+        }
+        double q_d = 0.0;
+        for (const auto & c : dists[i]) {
+            if (c.id == draft[i]) { q_d = c.p; break; }
+        }
+        q_d = std::max(q_d, 1e-12);
+
+        if (unif(rng) * q_d < p_d) {
+            common_sampler_accept(smpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        // rejected: correction token from the residual over the target's candidate set
+        double Z = 0.0;
+        std::vector<double> r(cur_p->size, 0.0);
+        for (size_t j = 0; j < cur_p->size; ++j) {
+            double q_j = 0.0;
+            for (const auto & c : dists[i]) {
+                if (c.id == cur_p->data[j].id) { q_j = c.p; break; }
+            }
+            r[j] = std::max(0.0, (double) cur_p->data[j].p - q_j);
+            Z += r[j];
+        }
+
+        llama_token corr;
+        if (Z <= 0.0) {
+            // p sits entirely under q on this support (or numeric dust): any target sample is
+            // exact here, so take the chain's own pick
+            corr = cur_p->data[cur_p->selected].id;
+        } else {
+            double u = unif(rng) * Z;
+            size_t j = 0;
+            for (; j + 1 < cur_p->size; ++j) {
+                u -= r[j];
+                if (u <= 0.0) break;
+            }
+            corr = cur_p->data[j].id;
+        }
+
+        common_sampler_accept(smpl, corr, true);
+        result.push_back(corr);
+        return result;
+    }
+
+    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    common_sampler_accept(smpl, id, true);
+    result.push_back(id);
+
+    return result;
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -271,6 +353,11 @@ struct server_slot {
     bool spec_suspend_once = false;
     std::mt19937 spec_synth_rng;
 
+    // stochastic speculative verification: per drafted token, the distribution it was sampled
+    // from (filled by the drafter when Q4X_SPEC_STOCH is active), and the acceptance RNG
+    common_speculative_dists spec_draft_dists;
+    std::mt19937             spec_stoch_rng;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -386,6 +473,7 @@ struct server_slot {
         spec_guard_pos   = -1;
         spec_guard_count = 0;
         spec_suspend_once = false;
+        spec_draft_dists.clear();
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -1815,6 +1903,13 @@ private:
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
             }
+
+            if (spec && getenv("Q4X_SPEC_STOCH") != nullptr) {
+                const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
+                    ? std::random_device{}()
+                    : task.params.sampling.seed + 0x9e3779b9u * (uint32_t) (slot.id + 1);
+                slot.spec_stoch_rng.seed(seed);
+            }
         } else {
             slot.smpl.reset();
         }
@@ -3017,6 +3112,8 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        slot.spec_draft_dists.clear();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -3024,6 +3121,7 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .dists    = */ &slot.spec_draft_dists,
                         };
 
                         drafting.push_back(&slot);
@@ -3904,7 +4002,22 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
+
+                // stochastic verification only when the whole draft carries aligned sampling
+                // distributions (the drafter fills them in stoch mode); replay, grammar and
+                // synth all fall back to the existing paths
+                static const bool spec_stoch_env = getenv("Q4X_SPEC_STOCH") != nullptr;
+                const bool use_stoch = spec_stoch_env &&
+                        synth_probs.empty() &&
+                        !slot.spec_is_replay &&
+                        slot.task->params.sampling.grammar.empty() &&
+                        slot.spec_draft_dists.size() >= slot.spec_draft.size();
+
+                auto accepted = use_stoch
+                    ? server_sample_and_accept_stoch(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            slot.spec_draft_dists, slot.spec_stoch_rng)
+                    : synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
@@ -3929,6 +4042,10 @@ private:
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
+                        // replay tokens are target-accepted, not drafter-sampled: their recorded
+                        // distributions no longer align, so replay verification falls back to
+                        // exact-match (which re-accepts target-originated tokens)
+                        slot.spec_draft_dists.clear();
 
                         const auto & ckpt = slot.spec_ckpt;
 
