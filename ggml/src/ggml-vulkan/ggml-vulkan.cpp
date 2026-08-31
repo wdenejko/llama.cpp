@@ -5874,10 +5874,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         rm_stdq_int = 2;
     }
     // [Q4X] GGML_VK_MMV_RM_STDQ / GGML_VK_MMV_RM_KQ: rows-per-workgroup overrides
-    // for the dequant mul_mat_vec (decode GEMV) pipelines. Only GCN was ever
-    // hand-tuned (2/4); RDNA3.5 falls through to the generic 1/2 and the perf
-    // profile shows the vocab-head mat-vec at ~1/4 efficiency (~11% of a decode
-    // step). Sweep knobs, off by default; rm_iq follows rm_kq.
+    // for the dequant mul_mat_vec (decode GEMV) pipelines. VERDICT 2026-08-31:
+    // FLAT on gfx1151 - KQ 2->4->8 all within 0.3% tg, STDQ 2 = -1.1..-1.5%
+    // (sweep repeatability 0.1%, so the knob provably engages). The "1/4
+    // efficiency" premise was FLOPs-vs-peak; the vocab-head GEMV actually runs
+    // ~227 GB/s ~= 89% of DRAM bandwidth - already at the roofline that matters.
+    // Knobs stay for other models/boxes; rm_iq follows rm_kq.
     {
         const char * env_stdq = getenv("GGML_VK_MMV_RM_STDQ");
         if (env_stdq && atoi(env_stdq) > 0) {
