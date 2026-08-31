@@ -16,7 +16,12 @@ export PATH="$PATH:/usr/sbin:/sbin"
 TOOLBOX=llama-nudge-vulkan
 BIN=/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin   # rebased build WITH MTP (old build/ has NO MTP)
 MODELS=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF
+# remember whether the user pinned these before defaults land — the deep-ctx guard
+# below only auto-picks knobs the user left alone
+MD_USER="${MD:+1}"
+UB_USER="${UB:+1}"
 MD="${MD:-/home/wdenejko/models/Qwen3.8-Flash-Next-MTP-Q8_0-GGUF/Qwen3.8-Flash-Next-MTP-Q8_0.gguf}"  # MTP draft head (env-overridable)
+MDQ4=/home/wdenejko/models/Qwen3.8-Flash-Next-MTP-Q8_0-GGUF/Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf
 
 QUANT="${QUANT:-Q4_K_XL}"
 PORT="${PORT:-8080}"
@@ -29,6 +34,21 @@ REASONING="${REASONING:-medium}"     # xhigh|medium|low = think ON at that effor
                                      # (enable_thinking=false -> empty <think></think>), NOT --reasoning-effort none.
 TEMP="${TEMP:-1.0}"                  # 1.0 = creative default; set 0 for deterministic work (REQUIRED for MTP to help)
 MTP="${MTP:-0}"                      # 0 = plain base decode (right for temp 1.0); 1 = MTP (only useful at TEMP=0)
+
+# Deep-context MTP guard (DEEPMTP=0 disables). MEASURED envelopes: the default Q8 draft is
+# proven to ~96k and host-OOMs ~129k; the Q4 draft covers 128k; at the full 262144 the fit
+# needs Q4 draft + UB=512 (validated 2026-08-31: loads+serves, gtt 90G — but host avail is
+# only ~3.2G, so the deepest reaches risk host OOM and cold-PLE thrash).
+if [ "${DEEPMTP:-1}" != "0" ] && [ "$MTP" = "1" ]; then
+  if [ -z "$MD_USER" ] && [ "$CTX" -gt 98304 ] && [ -f "$MDQ4" ]; then
+    MD="$MDQ4"
+    echo "[run-flashnext] deep-ctx: CTX=$CTX > 98304 with MTP — switching to the Q4 draft (MD=<path> or DEEPMTP=0 overrides)" >&2
+  fi
+  if [ -z "$UB_USER" ] && [ "$CTX" -gt 131072 ]; then
+    UB=512
+    echo "[run-flashnext] deep-ctx: CTX=$CTX > 131072 with MTP — UB=512 for the validated 262k fit (UB=N or DEEPMTP=0 overrides)" >&2
+  fi
+fi
 PARALLEL="${PARALLEL:-1}"            # 1 = single stream = fastest PER REQUEST; higher = concurrency but dilutes each
 UB="${UB:-2048}"                     # physical batch. MEASURED pp4096 on this box: 512->2048 is +25% coopmat-OFF
                                      # (386->484) and +14% coopmat-ON (494->564); plateaus by 3072. ub2048 verified
@@ -144,9 +164,12 @@ if [ "$MTP" = "1" ]; then
   # (commit 81aa39c17). VALIDATED: coopmat-ON MTP ran 20 min / 84 code gens with 0 deadlocks, 0 livelocks,
   # 0 stalls at full decode speed (32-37 t/s). The old OFF workaround is now opt-in via COOPMAT=0. The
   # coopmat-ON graph init is GTT-sensitive under memory pressure -> see the launch preamble below.
-  if [ "$TEMP" != "0" ] && [ "$TEMP" != "0.0" ]; then
-    echo "[run-flashnext] WARNING: MTP=1 with TEMP=$TEMP is pointless — MTP is a WASH above temp 0 (measured 25.7 vs 25.8)." >&2
-    echo "[run-flashnext]          It only speeds up greedy decode. Set TEMP=0, or use MTP=0 to save ~4GB on the draft model." >&2
+  # NB the old "MTP is a wash above temp 0" warning is DEAD: with stochastic speculative
+  # sampling (auto-on at TEMP>0) MTP measured 37.9 vs ~26 t/s at temp 1. Only warn when the
+  # user disabled stoch by hand — exact-match verify at temp>0 really is a wash.
+  if [ "${SPEC_STOCH:-1}" = "0" ] && [ "$TEMP" != "0" ] && [ "$TEMP" != "0.0" ]; then
+    echo "[run-flashnext] WARNING: MTP=1 + SPEC_STOCH=0 at TEMP=$TEMP is a wash (exact-match verify only accepts at ~p)." >&2
+    echo "[run-flashnext]          Drop SPEC_STOCH=0, or set TEMP=0, or use MTP=0 to save ~4GB on the draft model." >&2
   fi
 fi
 
