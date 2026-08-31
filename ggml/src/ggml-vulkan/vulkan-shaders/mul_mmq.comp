@@ -66,6 +66,11 @@ layout (push_constant) uniform parameter
     uint padded_N;
     uint use_row_lists;
     uint fusion_flags;
+    // unused here; keeps the block's layout identical to mul_mm.comp so both
+    // match the one host-side vk_mat_mat_id_push_constants
+    uint tile_list_base;
+    uint n_experts;
+    uint hoist_row_ids;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -175,27 +180,29 @@ void main() {
     if (p.use_row_lists != 0) {
         // mmq always uses the z-slice-per-expert grid (MMID_COMPACT is gated off for it)
         load_row_ids_from_lists(gl_NumWorkGroups.z, expert_idx, ic);
+    } else if (p.hoist_row_ids != 0) {
+        load_row_ids_hoisted(expert_idx, ic);
     } else {
 #ifdef MUL_MAT_ID_USE_SUBGROUPS
-    if (bitCount(p.nei0) == 1) {
-        load_row_ids(expert_idx, true, ic);
-    } else {
-        load_row_ids(expert_idx, false, ic);
-    }
+        if (bitCount(p.nei0) == 1) {
+            load_row_ids(expert_idx, true, ic);
+        } else {
+            load_row_ids(expert_idx, false, ic);
+        }
 #else
-    _ne1 = 0;
-    for (uint ii1 = 0; ii1 < p.nei1 && _ne1 < (ic + 1) * BN; ii1++) {
-        for (uint ii0 = 0; ii0 < p.nei0 && _ne1 < (ic + 1) * BN; ii0++) {
-            if (data_ids[ii1*p.nbi1 + ii0] == expert_idx) {
-                if (_ne1 >= ic * BN) {
-                    row_ids[_ne1 - ic * BN] = u16vec2(ii0, ii1);
+        _ne1 = 0;
+        for (uint ii1 = 0; ii1 < p.nei1 && _ne1 < (ic + 1) * BN; ii1++) {
+            for (uint ii0 = 0; ii0 < p.nei0 && _ne1 < (ic + 1) * BN; ii0++) {
+                if (data_ids[ii1*p.nbi1 + ii0] == expert_idx) {
+                    if (_ne1 >= ic * BN) {
+                        row_ids[_ne1 - ic * BN] = u16vec2(ii0, ii1);
+                    }
+                    _ne1++;
                 }
-                _ne1++;
             }
         }
-    }
 
-    barrier();
+        barrier();
 #endif
     }
 
