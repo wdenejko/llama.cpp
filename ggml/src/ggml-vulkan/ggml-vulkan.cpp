@@ -5338,14 +5338,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     m_mmq_wg_denoms_id128[1] = 48;
                 }
             }
-            // GGML_VK_MMID_BK64=1: deepen the medium mmid tile's K block 32->64 -
-            // half the K-loop barrier iterations per tile. The per-type perf verdict
-            // said the expert GEMM is latency-structure-bound (not bytes, not dequant
-            // ALU), so fewer barrier round-trips is the cheapest remaining probe.
-            // LDS stays comfortable ((BM+BN)*(BK+pad)*2B ~= 25KB of 64KB, still
-            // checked by ggml_vk_matmul_shmem_support); expert K dims 2560/640 both
-            // divide 64, so the aligned variants keep engaging. Off by default
-            // pending A/B.
+            // GGML_VK_MMID_BK64=1: deepen the medium mmid tile's K block 32->64.
+            // VERDICT 2026-08-31: DEAD, keep off. The first A/B's +5.7% d0 / +9.3%
+            // @32k was fictitious - the q4_0/q4_1/q5_0/q5_1 shmem loaders scrambled
+            // the A tile at BK > 32 (write race between the second block's lows and
+            // the first block's highs; fixed block-relative in mul_mm_funcs.glsl),
+            // and with correct stores BK=64 measures -3.4..-6.3% at every depth
+            // (needles/harness green both legs). The barrier-halving gain never
+            // materializes; the deeper block only costs LDS/occupancy.
             const char * bk64_env = getenv("GGML_VK_MMID_BK64");
             if (bk64_env && atoi(bk64_env) != 0) {
                 m_warptile_mmq_id128[3] = 64;  // BK
