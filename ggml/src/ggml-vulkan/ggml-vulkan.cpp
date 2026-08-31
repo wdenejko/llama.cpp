@@ -5873,6 +5873,21 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         rm_stdq = 2;
         rm_stdq_int = 2;
     }
+    // [Q4X] GGML_VK_MMV_RM_STDQ / GGML_VK_MMV_RM_KQ: rows-per-workgroup overrides
+    // for the dequant mul_mat_vec (decode GEMV) pipelines. Only GCN was ever
+    // hand-tuned (2/4); RDNA3.5 falls through to the generic 1/2 and the perf
+    // profile shows the vocab-head mat-vec at ~1/4 efficiency (~11% of a decode
+    // step). Sweep knobs, off by default; rm_iq follows rm_kq.
+    {
+        const char * env_stdq = getenv("GGML_VK_MMV_RM_STDQ");
+        if (env_stdq && atoi(env_stdq) > 0) {
+            rm_stdq = (uint32_t) atoi(env_stdq);
+        }
+        const char * env_kq = getenv("GGML_VK_MMV_RM_KQ");
+        if (env_kq && atoi(env_kq) > 0) {
+            rm_kq = (uint32_t) atoi(env_kq);
+        }
+    }
     uint32_t rm_iq = 2 * rm_kq;
 
     const bool use_subgroups = device->subgroup_arithmetic;
