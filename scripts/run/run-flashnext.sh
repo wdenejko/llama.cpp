@@ -8,7 +8,7 @@
 #     partly the rollback quality bug + older build; stochastic spec sampling adds the rest).
 # Rule: MTP=1 is worth it at any temperature now; TEMP=0 remains the fastest for pure code.
 # Q4_K_XL is the only quant we keep. Creative sampling = unsloth thinking-mode rec.
-# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1] [FREE_GPU=1] [UBD=512] [KVD=q8_0] [MD=<draft.gguf>] [SPEC_STOCH=1] [PMIN=0.75] [RSROLL=0] [BLKTOPK=1]
+# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1] [FREE_GPU=1] [UBD=512] [KVD=q8_0] [KV=<f16|q8_0>] [MD=<draft.gguf>] [SPEC_STOCH=1] [PMIN=0.75] [RSROLL=0] [BLKTOPK=1]
 #   Creative/chat (default):     ./run-flashnext.sh
 #   Fast deterministic code:     MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
 #   Fast reasoning/creative:     MTP=1 ./run-flashnext.sh   (temp 1, stoch spec sampling auto-on)
@@ -237,10 +237,15 @@ fi
 # when the server exits or is interrupted.
 VERBOSE_ARGS=()
 [ "${VERBOSE:-0}" = "1" ] && VERBOSE_ARGS=(--verbose)
+# KV=q8_0 quantizes the TARGET's KV caches (12 attn layers 6144MiB->3264 + indexer 2304->1224 at
+# 262k). Perf is a wash (36/48 layers are recurrent) but it frees ~3.9GB — the difference between
+# fitting and host-OOM for 262k + UB=2048 + the Q4 draft on the 128GB box. Empty = f16.
+KV_ARGS=()
+[ -n "${KV:-}" ] && KV_ARGS=(-ctk "$KV" -ctv "$KV")
 toolbox run --container "$TOOLBOX" env "${VK_ENV[@]}" LD_LIBRARY_PATH="$BIN" \
   "$BIN/llama-server" -m "$MODEL" "${VERBOSE_ARGS[@]}" \
     --alias flashnext --host 0.0.0.0 --port "$PORT" \
-    -ngl "$NGL" -c "$CTX" -ub "$UB" --flash-attn "$FA" "${OT_ARGS[@]}" --metrics \
+    -ngl "$NGL" -c "$CTX" -ub "$UB" --flash-attn "$FA" "${KV_ARGS[@]}" "${OT_ARGS[@]}" --metrics \
     --parallel "$PARALLEL" \
     --temp "$TEMP" --top-p 0.95 --top-k 20 --min-p 0.0 \
     --presence-penalty 0.0 --repeat-penalty 1.0 \
