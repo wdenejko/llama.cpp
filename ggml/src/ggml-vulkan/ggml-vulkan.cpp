@@ -5917,12 +5917,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     }
     // RDNA3: above four columns, static 4 rows for all types bench faster than the default
     const bool is_rdna3 = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA3;
-    // [Q4X] upstream #27909 tuned the static-4-rows dispatch on RDNA3 dGPUs; on gfx1151
-    // (Strix Halo APU, 40 CU) it under-occupies the expert GEMVs. Default off here;
-    // GGML_VK_RDNA3_MMV_TUNE=1 re-enables the upstream dispatch.
+    // [Q4X] upstream #27909 static-4-rows RDNA3 dispatch, A/B'd on gfx1151 2026-08-31
+    // (steady-state 256-tok method): d0 tg equal, @32k +6% tg vs the generic rows.
+    // Default follows upstream; GGML_VK_RDNA3_MMV_TUNE=0 restores the generic dispatch.
     static const bool rdna3_mmv_tune = [] {
         const char * e = getenv("GGML_VK_RDNA3_MMV_TUNE");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr || atoi(e) != 0;
     }();
     const bool is_rdna3_tuned = is_rdna3 && rdna3_mmv_tune;
     auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_tuned && i >= 4) ? 4u : rows; };
