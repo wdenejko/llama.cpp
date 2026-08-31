@@ -302,24 +302,37 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
-    ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
-    cb(gate, "hc_gate", il);
+    ggml_tensor * up_out = build_lora_mm(w_up, lo);
 
-    ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
-    gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+    // [Q4X] fused mix tail: sigmoid + gate-mul + mean-collapse in one op
+    // (replaces ~7 tiny dispatches per call, x96 per decode token).
+    // Q4X_HC_MIX_NOFUSE=1 forces the primitive chain (A/B and correctness checks).
+    static const bool q4x_mix_nofuse = getenv("Q4X_HC_MIX_NOFUSE") != nullptr;
 
-    // collapse the streams by their mean
-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
-            ggml_row_size(gated->type, n_embd) * hc, 0);
-    mixed = ggml_cont(ctx0, mixed);
-    for (int64_t c = 1; c < hc; ++c) {
-        ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
-                ggml_row_size(gated->type, n_embd) * hc,
-                ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx0, mixed, s);
+    ggml_tensor * mixed;
+    if (!q4x_mix_nofuse) {
+        mixed = ggml_q4x_hc_mix_collapse(ctx0, xn, up_out, (int32_t) hc);
+        cb(mixed, "hc_mixed", il);
+    } else {
+        ggml_tensor * gate = ggml_sigmoid(ctx0, up_out);
+        cb(gate, "hc_gate", il);
+
+        ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
+        gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+
+        // collapse the streams by their mean
+        mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
+                ggml_row_size(gated->type, n_embd) * hc, 0);
+        mixed = ggml_cont(ctx0, mixed);
+        for (int64_t c = 1; c < hc; ++c) {
+            ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+                    ggml_row_size(gated->type, n_embd) * hc,
+                    ggml_row_size(gated->type, n_embd) * c);
+            mixed = ggml_add(ctx0, mixed, s);
+        }
+        mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+        cb(mixed, "hc_mixed", il);
     }
-    mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
-    cb(mixed, "hc_mixed", il);
 
     if (inject) {
         // The inject projection is w_inject^T @ xn, i.e. M = hc (= 4), N = n_tokens: a

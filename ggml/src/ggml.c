@@ -1087,6 +1087,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "Q4X_QSA_UNION",
     "Q4X_QSA_MASK_GATHER",
     "Q4X_QSA_KV_GATHER",
+    "Q4X_HC_MIX_COLLAPSE",
 
     "UNARY",
 
@@ -1104,7 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1206,6 +1207,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "q4x_qsa_union(top_k)",
     "q4x_qsa_mask_gather(mask, list)",
     "q4x_qsa_kv_gather(rows, list)",
+    "q4x_hc_mix_collapse(xn, up)",
 
     "unary(x)",
 
@@ -1223,7 +1225,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6613,6 +6615,30 @@ struct ggml_tensor * ggml_q4x_qsa_kv_gather(
     result->op     = GGML_OP_Q4X_QSA_KV_GATHER;
     result->src[0] = rows;
     result->src[1] = list;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_q4x_hc_mix_collapse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * xn,
+        struct ggml_tensor  * up,
+        int32_t               hc) {
+    GGML_ASSERT(xn->type == GGML_TYPE_F32);
+    GGML_ASSERT(up->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(xn));
+    GGML_ASSERT(ggml_is_contiguous(up));
+    GGML_ASSERT(ggml_are_same_shape(xn, up));
+    GGML_ASSERT(xn->ne[2] == 1 && xn->ne[3] == 1);
+    GGML_ASSERT(hc > 0 && xn->ne[0] % hc == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, xn->ne[0]/hc, xn->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, hc);
+
+    result->op     = GGML_OP_Q4X_HC_MIX_COLLAPSE;
+    result->src[0] = xn;
+    result->src[1] = up;
 
     return result;
 }

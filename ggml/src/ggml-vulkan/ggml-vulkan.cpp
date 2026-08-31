@@ -1093,6 +1093,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_q4x_qsa_union;
     vk_pipeline pipeline_q4x_qsa_mask_gather;
     vk_pipeline pipeline_q4x_qsa_kv_gather;
+    vk_pipeline pipeline_q4x_hc_mix_collapse;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1967,6 +1968,9 @@ struct vk_op_q4x_qsa_mask_gather_push_constants {
 };
 struct vk_op_q4x_qsa_kv_gather_push_constants {
     uint32_t row_sz, c_max, n_rows, ss1;
+};
+struct vk_op_q4x_hc_mix_collapse_push_constants {
+    uint32_t E, hc, ne, sx1, su1, sd1;
 };
 
 struct vk_op_q4x_hc_combine_push_constants {
@@ -6688,6 +6692,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_q4x_qsa_kv_gather,
         "q4x_qsa_kv_gather", q4x_qsa_kv_gather_len, q4x_qsa_kv_gather_data, "main", 3,
         sizeof(vk_op_q4x_qsa_kv_gather_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_q4x_hc_mix_collapse,
+        "q4x_hc_mix_collapse", q4x_hc_mix_collapse_len, q4x_hc_mix_collapse_data, "main", 3,
+        sizeof(vk_op_q4x_hc_mix_collapse_push_constants), {256, 1, 1}, {}, 1);
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size}, 1, true, true);
@@ -14992,6 +14999,28 @@ static void ggml_vk_q4x_qsa_kv_gather(ggml_backend_vk_context * ctx, vk_context&
         pc, {row_sz * c_max, 1, 1});
 }
 
+static void ggml_vk_q4x_hc_mix_collapse(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * xn = dst->src[0];
+    const ggml_tensor * up = dst->src[1];
+
+    const uint32_t E  = (uint32_t) dst->ne[0];
+    const uint32_t nt = (uint32_t) dst->ne[1];
+
+    const vk_op_q4x_hc_mix_collapse_push_constants pc = {
+        E, (uint32_t) ggml_get_op_params_i32(dst, 0), E * nt,
+        (uint32_t) (xn->nb[1] / sizeof(float)),
+        (uint32_t) (up->nb[1] / sizeof(float)),
+        (uint32_t) (dst->nb[1] / sizeof(float)),
+    };
+
+    vk_pipeline pipeline = ctx->device->pipeline_q4x_hc_mix_collapse;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {ggml_vk_tensor_subbuffer(ctx, xn), ggml_vk_tensor_subbuffer(ctx, up),
+         ggml_vk_tensor_subbuffer(ctx, dst)},
+        pc, {E * nt, 1, 1});
+}
+
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -18014,6 +18043,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     case GGML_OP_Q4X_QSA_KV_GATHER:
         ggml_vk_q4x_qsa_kv_gather(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_Q4X_HC_MIX_COLLAPSE:
+        ggml_vk_q4x_hc_mix_collapse(ctx, compute_ctx, node);
 
         break;
 
@@ -21179,6 +21213,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_Q4X_QSA_KV_GATHER:
             return op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_I32 &&
                 op->type == GGML_TYPE_F16;
+        case GGML_OP_Q4X_HC_MIX_COLLAPSE:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32;
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 const ggml_tensor * q = op->src[0];

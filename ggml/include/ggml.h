@@ -578,6 +578,7 @@ extern "C" {
         GGML_OP_Q4X_QSA_UNION,
         GGML_OP_Q4X_QSA_MASK_GATHER,
         GGML_OP_Q4X_QSA_KV_GATHER,
+        GGML_OP_Q4X_HC_MIX_COLLAPSE,
 
         GGML_OP_UNARY,
 
@@ -2689,6 +2690,14 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * rows,
             struct ggml_tensor  * list);
+
+    // [Q4X] qwen4exp HC mix tail: out[i,t] = (1/hc) * sum_c xn[c*E+i,t] * sigmoid(up[c*E+i,t])
+    // where E = xn->ne[0]/hc. Replaces sigmoid+mul+cont+(hc-1) adds+scale.
+    GGML_API struct ggml_tensor * ggml_q4x_hc_mix_collapse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * xn,
+            struct ggml_tensor  * up,
+            int32_t               hc);
 
     GGML_API struct ggml_tensor * ggml_q4x_hc_combine(
             struct ggml_context * ctx,

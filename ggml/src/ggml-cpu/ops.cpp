@@ -11428,6 +11428,36 @@ void ggml_compute_forward_q4x_qsa_kv_gather(
     }
 }
 
+// ggml_compute_forward_q4x_hc_mix_collapse
+
+void ggml_compute_forward_q4x_hc_mix_collapse(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * xn = dst->src[0];
+    const ggml_tensor * up = dst->src[1];
+
+    const int32_t hc = ggml_get_op_params_i32(dst, 0);
+    const int64_t E  = dst->ne[0];
+    const int64_t nt = dst->ne[1];
+
+    for (int64_t t = 0; t < nt; ++t) {
+        const float * xr = (const float *) ((const char *) xn->data + t*xn->nb[1]);
+        const float * ur = (const float *) ((const char *) up->data + t*up->nb[1]);
+        float * out = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t i = 0; i < E; ++i) {
+            float acc = 0.0f;
+            for (int32_t c = 0; c < hc; ++c) {
+                const float g = 1.0f / (1.0f + expf(-ur[c*E + i]));
+                acc += xr[c*E + i] * g;
+            }
+            out[i] = acc / (float) hc;
+        }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(
