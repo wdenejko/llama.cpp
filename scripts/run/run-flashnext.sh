@@ -36,19 +36,25 @@ REASONING="${REASONING:-medium}"     # xhigh|medium|low = think ON at that effor
 TEMP="${TEMP:-1.0}"                  # 1.0 = creative default; set 0 for deterministic work (REQUIRED for MTP to help)
 MTP="${MTP:-0}"                      # 0 = plain base decode (right for temp 1.0); 1 = MTP (only useful at TEMP=0)
 
-# Deep-context MTP guard (DEEPMTP=0 disables). MEASURED envelopes: the default Q8 draft is
-# proven to ~96k and host-OOMs ~129k; the Q4 draft covers 128k; at the full 262144 the fit
-# keeps UB=2048 by quantizing the target KV to q8_0 (frees ~3.9GB = the draft's cost;
-# validated 2026-08-31: pp2048 597, pp@33k 478, tg@33k 46, q8-vs-f16 KV a <1% wash — the
-# wall is host RAM, not GTT, so f16 KV + draft + ub2048 gets the OOM killer instead).
-if [ "${DEEPMTP:-1}" != "0" ] && [ "$MTP" = "1" ]; then
-  if [ -z "$MD_USER" ] && [ "$CTX" -gt 98304 ] && [ -f "$MDQ4" ]; then
+# Deep-context guard (DEEPMTP=0 disables). MEASURED envelopes: the default Q8 draft is
+# proven to ~96k and host-OOMs ~129k; the Q4 draft covers 128k; KV=q8_0 (a <1% perf wash,
+# 36/48 layers are recurrent) frees ~3.9GB so 262k boots with UB=2048. The wall is host RAM,
+# not GTT — and it moves DURING use: KV pages acquire physical backing as context fills, so
+# the ub2048 boot fit dies to the OOM killer at ~192k of actual fill (measured mid-prefill).
+# UB=1024 gives the ~4GB back: full 252k fill validated (pp avg 209, decode 29, 2.8G spare).
+# Two-tier choice: jobs that stay under ~190k fill can pin UB=2048 for +10% shallow prefill.
+if [ "${DEEPMTP:-1}" != "0" ]; then
+  if [ "$MTP" = "1" ] && [ -z "$MD_USER" ] && [ "$CTX" -gt 98304 ] && [ -f "$MDQ4" ]; then
     MD="$MDQ4"
     echo "[run-flashnext] deep-ctx: CTX=$CTX > 98304 with MTP — switching to the Q4 draft (MD=<path> or DEEPMTP=0 overrides)" >&2
   fi
   if [ -z "$KV_USER" ] && [ "$CTX" -gt 131072 ]; then
     KV=q8_0
-    echo "[run-flashnext] deep-ctx: CTX=$CTX > 131072 with MTP — KV=q8_0 so UB=2048 still fits (KV=f16 or DEEPMTP=0 overrides)" >&2
+    echo "[run-flashnext] deep-ctx: CTX=$CTX > 131072 — KV=q8_0 frees ~3.9GB of host RAM (KV=f16 or DEEPMTP=0 overrides)" >&2
+  fi
+  if [ -z "$UB_USER" ] && [ "$CTX" -gt 196608 ]; then
+    UB=1024
+    echo "[run-flashnext] deep-ctx: CTX=$CTX > 196608 — UB=1024 so a full-depth fill survives (ub2048 host-OOMs at ~192k fill; UB=2048 to force, DEEPMTP=0 disables)" >&2
   fi
 fi
 PARALLEL="${PARALLEL:-1}"            # 1 = single stream = fastest PER REQUEST; higher = concurrency but dilutes each
