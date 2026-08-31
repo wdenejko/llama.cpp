@@ -44,8 +44,10 @@ static bool q4x_topk_dump_cb(struct ggml_tensor * t, bool ask, void * user_data)
     const size_t n = ggml_nelements(t);
     std::vector<int32_t> host(n);
     ggml_backend_tensor_get(t, host.data(), 0, n * sizeof(int32_t));
+    // fixed 64-byte zero-padded name field in the dump; memcpy of the measured length
+    // keeps gcc's -Werror=format-truncation out of it
     char name[64] = {0};
-    snprintf(name, sizeof(name) - 1, "%s", t->name);
+    memcpy(name, t->name, strnlen(t->name, sizeof(name) - 1));
     int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
     fwrite(name, 1, sizeof(name), st->f);
     fwrite(ne, sizeof(int64_t), 4, st->f);
