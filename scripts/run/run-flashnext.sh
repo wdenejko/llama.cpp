@@ -89,11 +89,17 @@ done
 # byte-equal, so this is purely a perf call). GATHER=N re-enables from N cells (1 = always).
 [ -n "${GATHER:-}" ] && VK_ENV+=(Q4X_QSA_GATHER="$GATHER")
 # Q4X_QSA_GP: gathered sparse PREFILL - per 128-token tile, dedup the top-k selections and
-# run FA over the gathered union (~45-50% of n_kv at 32k) instead of streaming the whole
-# cache. Math-equal to masked-dense (mask gathered from the same sparse mask). OFF by
-# default pending A/B; GP=N engages from n_kv >= N (try GP=24576). GP_W tile width,
-# GP_FRAC gathered-list capacity as a fraction of n_kv (union overflow drops cells).
-[ -n "${GP:-}" ]      && VK_ENV+=(Q4X_QSA_GP="$GP")
+# run FA over the gathered union instead of streaming the whole cache. Math-equal to
+# masked-dense (mask gathered from the same sparse mask). DEFAULT ON 2026-08-31 from 28k
+# depth: chain-segment marginals +6.2% @32-41k, +5.9% @41-49k, +10.3% @49-57k, +9.9%
+# @57-63k (MTP=1), fresh-40k prefill +2.9%; d0/decode untouched; needles 32k/64k all HIT,
+# harness 10/10, accept unchanged. NB single-2048-probe benches UNDERSTATE this lever -
+# judge it on >=6k marginal windows. GP=0 disables; GP=N moves the engage depth. GP_W tile
+# width (128 measured best; 512 worse), GP_FRAC list capacity as a fraction of n_kv
+# (default 0.62; union max measured 51.5% @32k / 47.4% @64k at W=128 - re-dump before
+# lowering or engaging shallower).
+GP="${GP:-28672}"
+[ "$GP" != "0" ]      && VK_ENV+=(Q4X_QSA_GP="$GP")
 [ -n "${GP_W:-}" ]    && VK_ENV+=(Q4X_QSA_GP_W="$GP_W")
 [ -n "${GP_FRAC:-}" ] && VK_ENV+=(Q4X_QSA_GP_FRAC="$GP_FRAC")
 # POOLED=0 disables the QSA pooled-key summary cache (default on in the binary; this is the
