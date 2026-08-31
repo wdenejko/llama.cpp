@@ -305,7 +305,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     ggml_tensor * up_out = build_lora_mm(w_up, lo);
 
     // [Q4X] fused mix tail: sigmoid + gate-mul + mean-collapse in one op
-    // (replaces ~7 tiny dispatches per call, x96 per decode token).
+    // (replaces ~7 tiny dispatches per call, x96 per decode token). VERDICT
+    // 2026-08-31: +0.5-0.9% tg / +0.3-0.6% pp, needle-validated (32k/64k HIT,
+    // harness 10/10, accept unchanged; text diff = benign FMA contraction).
     // Q4X_HC_MIX_NOFUSE=1 forces the primitive chain (A/B and correctness checks).
     static const bool q4x_mix_nofuse = getenv("Q4X_HC_MIX_NOFUSE") != nullptr;
 
