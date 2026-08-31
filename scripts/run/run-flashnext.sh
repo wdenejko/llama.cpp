@@ -20,6 +20,7 @@ MODELS=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF
 # below only auto-picks knobs the user left alone
 MD_USER="${MD:+1}"
 UB_USER="${UB:+1}"
+KV_USER="${KV:+1}"
 MD="${MD:-/home/wdenejko/models/Qwen3.8-Flash-Next-MTP-Q8_0-GGUF/Qwen3.8-Flash-Next-MTP-Q8_0.gguf}"  # MTP draft head (env-overridable)
 MDQ4=/home/wdenejko/models/Qwen3.8-Flash-Next-MTP-Q8_0-GGUF/Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf
 
@@ -37,16 +38,17 @@ MTP="${MTP:-0}"                      # 0 = plain base decode (right for temp 1.0
 
 # Deep-context MTP guard (DEEPMTP=0 disables). MEASURED envelopes: the default Q8 draft is
 # proven to ~96k and host-OOMs ~129k; the Q4 draft covers 128k; at the full 262144 the fit
-# needs Q4 draft + UB=512 (validated 2026-08-31: loads+serves, gtt 90G — but host avail is
-# only ~3.2G, so the deepest reaches risk host OOM and cold-PLE thrash).
+# keeps UB=2048 by quantizing the target KV to q8_0 (frees ~3.9GB = the draft's cost;
+# validated 2026-08-31: pp2048 597, pp@33k 478, tg@33k 46, q8-vs-f16 KV a <1% wash — the
+# wall is host RAM, not GTT, so f16 KV + draft + ub2048 gets the OOM killer instead).
 if [ "${DEEPMTP:-1}" != "0" ] && [ "$MTP" = "1" ]; then
   if [ -z "$MD_USER" ] && [ "$CTX" -gt 98304 ] && [ -f "$MDQ4" ]; then
     MD="$MDQ4"
     echo "[run-flashnext] deep-ctx: CTX=$CTX > 98304 with MTP — switching to the Q4 draft (MD=<path> or DEEPMTP=0 overrides)" >&2
   fi
-  if [ -z "$UB_USER" ] && [ "$CTX" -gt 131072 ]; then
-    UB=512
-    echo "[run-flashnext] deep-ctx: CTX=$CTX > 131072 with MTP — UB=512 for the validated 262k fit (UB=N or DEEPMTP=0 overrides)" >&2
+  if [ -z "$KV_USER" ] && [ "$CTX" -gt 131072 ]; then
+    KV=q8_0
+    echo "[run-flashnext] deep-ctx: CTX=$CTX > 131072 with MTP — KV=q8_0 so UB=2048 still fits (KV=f16 or DEEPMTP=0 overrides)" >&2
   fi
 fi
 PARALLEL="${PARALLEL:-1}"            # 1 = single stream = fastest PER REQUEST; higher = concurrency but dilutes each
