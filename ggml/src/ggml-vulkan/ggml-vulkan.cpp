@@ -5338,6 +5338,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     m_mmq_wg_denoms_id128[1] = 48;
                 }
             }
+            // GGML_VK_MMID_BK64=1: deepen the medium mmid tile's K block 32->64 -
+            // half the K-loop barrier iterations per tile. The per-type perf verdict
+            // said the expert GEMM is latency-structure-bound (not bytes, not dequant
+            // ALU), so fewer barrier round-trips is the cheapest remaining probe.
+            // LDS stays comfortable ((BM+BN)*(BK+pad)*2B ~= 25KB of 64KB, still
+            // checked by ggml_vk_matmul_shmem_support); expert K dims 2560/640 both
+            // divide 64, so the aligned variants keep engaging. Off by default
+            // pending A/B.
+            const char * bk64_env = getenv("GGML_VK_MMID_BK64");
+            if (bk64_env && atoi(bk64_env) != 0) {
+                m_warptile_mmq_id128[3] = 64;  // BK
+                static bool bk64_logged = false;
+                if (!bk64_logged) {
+                    fprintf(stderr, "ggml_vulkan: mmid medium tile BK=64 (GGML_VK_MMID_BK64)\n");
+                    bk64_logged = true;
+                }
+            }
         }
         {
         const auto &s_warptile_mmq = s_warptile_mmq_id16;
