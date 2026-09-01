@@ -1,8 +1,9 @@
 name: Fedora build (Vulkan)
 
-# Builds llama.cpp the same way the Strix Halo box does (Fedora + Vulkan/RADV,
-# LLAMA_USE_PREBUILT_UI=OFF per the fork's build recipe) and uploads a runnable
-# tarball of build/bin as a workflow artifact.
+# Builds llama.cpp in the EXACT environment of the Strix Halo box's toolbox
+# (Fedora 43, gcc 15.3.1, glslc 2026.1, Mesa 25.3.6, znver5 codegen — see
+# .devops/strix-halo-toolbox-vulkan.Dockerfile for the contract) and uploads
+# a runnable tarball of build/bin as a workflow artifact.
 
 on:
   workflow_dispatch:
@@ -27,38 +28,46 @@ concurrency:
 jobs:
   fedora-vulkan:
     runs-on: ubuntu-latest
-    container: fedora:42
+    container: registry.fedoraproject.org/fedora:43
     timeout-minutes: 90
     steps:
-      - name: Install build dependencies
+      - name: Install build dependencies (pinned to the box's toolbox versions)
         run: |
-          dnf install -y gcc gcc-c++ cmake git make tar gzip \
-            libcurl-devel vulkan-headers vulkan-loader-devel glslc nodejs-npm
+          dnf install -y --nodocs --setopt=install_weak_deps=False \
+            git-core make ninja-build tar gzip libcurl-devel nodejs-npm \
+            gcc-15.3.1-1.fc43 gcc-c++-15.3.1-1.fc43 cmake-3.31.11-1.fc43 \
+            glslc-2026.1-1.fc43 \
+            vulkan-headers-1.4.341.0-1.fc43 \
+            vulkan-loader-1.4.341.0-1.fc43 vulkan-loader-devel-1.4.341.0-1.fc43
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure
+      - name: Configure (mirrors the box's build-v2 flags; tests excluded from the tarball)
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          cmake -B build \
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_VULKAN=ON \
             -DGGML_NATIVE=OFF \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DLLAMA_USE_PREBUILT_UI=OFF
+            -DCMAKE_C_FLAGS="-march=znver5" -DCMAKE_CXX_FLAGS="-march=znver5" \
+            -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_BMI2=ON \
+            -DGGML_AVX512=ON -DGGML_AVX512_VBMI=ON -DGGML_AVX512_VNNI=ON -DGGML_AVX512_BF16=ON \
+            -DLLAMA_USE_PREBUILT_UI=OFF \
+            -DLLAMA_BUILD_TESTS=OFF
 
       - name: Build
         run: cmake --build build -j "$(nproc)"
 
       - name: Package
         run: |
-          tar -C build -czf llama-fedora42-vulkan-x86_64.tar.gz bin
-          ls -la llama-fedora42-vulkan-x86_64.tar.gz
+          tar -C build -czf llama-fedora43-vulkan-znver5.tar.gz bin
+          ls -la llama-fedora43-vulkan-znver5.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: llama-fedora42-vulkan-x86_64
-          path: llama-fedora42-vulkan-x86_64.tar.gz
+          name: llama-fedora43-vulkan-znver5
+          path: llama-fedora43-vulkan-znver5.tar.gz
           retention-days: 30
