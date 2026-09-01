@@ -1,0 +1,64 @@
+name: Fedora build (Vulkan)
+
+# Builds llama.cpp the same way the Strix Halo box does (Fedora + Vulkan/RADV,
+# LLAMA_USE_PREBUILT_UI=OFF per the fork's build recipe) and uploads a runnable
+# tarball of build/bin as a workflow artifact.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths: [
+      '.github/workflows/fedora-build.yml',
+      '**/CMakeLists.txt',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+      '**/*.comp',
+      '**/*.glsl'
+    ]
+
+concurrency:
+  group: fedora-build-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  fedora-vulkan:
+    runs-on: ubuntu-latest
+    container: fedora:42
+    timeout-minutes: 90
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y gcc gcc-c++ cmake git make tar gzip \
+            libcurl-devel vulkan-headers vulkan-loader-devel glslc nodejs-npm
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_VULKAN=ON \
+            -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_USE_PREBUILT_UI=OFF
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Package
+        run: |
+          tar -C build -czf llama-fedora42-vulkan-x86_64.tar.gz bin
+          ls -la llama-fedora42-vulkan-x86_64.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-fedora42-vulkan-x86_64
+          path: llama-fedora42-vulkan-x86_64.tar.gz
+          retention-days: 30
