@@ -14,11 +14,13 @@
 #   Fast deterministic code:     MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
 #   Fast reasoning/creative:     MTP=1 ./run-flashnext.sh   (temp 1, stoch spec sampling auto-on)
 export PATH="$PATH:/usr/sbin:/sbin"
-# TOOLBOX/BIN are overridable so the published GHCR image can serve with its own binaries:
-#   TOOLBOX=flashnext BIN=/usr/local/bin ./run-flashnext.sh
-# (image = ghcr.io/wdenejko/llama.cpp/strix-halo-toolbox:vulkan-radv, exact-env pinned)
-TOOLBOX="${TOOLBOX:-llama-nudge-vulkan}"
+# The serving container `wdenejko` is created from the published GHCR image
+# (ghcr.io/wdenejko/llama.cpp/strix-halo-toolbox:vulkan-radv, exact-env pinned); builds
+# happen in `wdenejko-build` (same pinned toolchain). Serve the image's own binaries with:
+#   BIN=/usr/local/bin ./run-flashnext.sh
+TOOLBOX="${TOOLBOX:-wdenejko}"
 BIN="${BIN:-/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin}"   # rebased build WITH MTP (old build/ has NO MTP)
+SRV_PAT="${BIN}/[l]lama-server"   # kill/refuse patterns track BIN so image-binary servers are covered too
 MODELS=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF
 # remember whether the user pinned these before defaults land — the deep-ctx guard
 # below only auto-picks knobs the user left alone
@@ -199,7 +201,7 @@ echo "[run-flashnext] build=build-v2 quant=$QUANT ctx=$CTX ngl=$NGL fa=$FA port=
 
 # Don't stack a second server on the coopmat-ON MTP path: its graph init can wedge graph_reserve into an
 # unkillable amdgpu D-state (needs a GPU reset/reboot) when a prior server's GTT is still held.
-if [ "$MTP" = "1" ] && [ "$COOPMAT" != "0" ] && pgrep -f "build-v2/bin/[l]lama-server" >/dev/null 2>&1; then
+if [ "$MTP" = "1" ] && [ "$COOPMAT" != "0" ] && pgrep -f "$SRV_PAT" >/dev/null 2>&1; then
   echo "[run-flashnext] a build-v2 llama-server is already running — stop it before launching coopmat-ON MTP." >&2
   exit 1
 fi
@@ -212,7 +214,7 @@ fi
 # pre-existing server.
 _FREED=0
 _shutdown() {
-  pkill -f "build-v2/bin/[l]lama-server" 2>/dev/null || true
+  pkill -f "$SRV_PAT" 2>/dev/null || true
   if [ "$_FREED" = "1" ]; then
     sleep 2
     echo "[run-flashnext] restarting comfyui + OCR" >&2
