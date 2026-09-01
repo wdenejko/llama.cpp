@@ -55,7 +55,7 @@ LABEL com.github.containers.toolbox="true" \
       summary="Strix Halo Flash-Next toolbox (Vulkan/RADV)"
 
 RUN microdnf -y --nodocs --setopt=install_weak_deps=0 install \
-  bash ca-certificates libatomic libstdc++ libgcc sudo \
+  bash ca-certificates libatomic libstdc++ libgcc libgomp sudo \
   vulkan-loader-1.4.341.0-1.fc43 vulkaninfo \
   mesa-vulkan-drivers-25.3.6-3.fc43 \
   radeontop procps-ng curl \
