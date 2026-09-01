@@ -1,47 +1,17 @@
-name: Strix Halo toolbox
+name: Toolbox image
 
 on:
   workflow_dispatch:
-    inputs:
-      backends:
-        description: 'Comma-separated: vulkan-radv, rocm-7.14 — or "all"'
-        required: false
-        default: vulkan-radv
 
 env:
-  IMAGE_BASE: ghcr.io/${{ github.repository_owner }}/llama.cpp/strix-halo-toolbox
+  IMAGE: ghcr.io/${{ github.repository }}/llama-vulkan-wdenejko
 
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix_json: ${{ steps.mk.outputs.matrix_json }}
-    steps:
-      - id: mk
-        shell: bash
-        run: |
-          IN='${{ inputs.backends }}'
-          if [[ "$IN" == "all" ]]; then
-            JSON='["vulkan-radv","rocm-7.14"]'
-          elif [[ -z "$IN" ]]; then
-            JSON='["vulkan-radv"]'
-          else
-            IN_CLEAN=$(echo "$IN" | tr -d '[:space:]')
-            JSON='["'${IN_CLEAN//,/\",\"}'"]'
-          fi
-          echo "matrix_json=${JSON}" >> "$GITHUB_OUTPUT"
-          echo "Using matrix: ${JSON}"
-
   build-and-push:
-    needs: prepare
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        backend: ${{ fromJson(needs.prepare.outputs.matrix_json) }}
     steps:
       - name: Free up runner disk space
         run: |
@@ -52,16 +22,6 @@ jobs:
 
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Map backend to Dockerfile
-        id: map
-        shell: bash
-        run: |
-          case '${{ matrix.backend }}' in
-            vulkan-radv) echo "dockerfile=.devops/strix-halo-toolbox-vulkan.Dockerfile" >> "$GITHUB_OUTPUT" ;;
-            rocm-7.14)   echo "dockerfile=.devops/strix-halo-toolbox-rocm.Dockerfile"   >> "$GITHUB_OUTPUT" ;;
-            *) echo "unknown backend '${{ matrix.backend }}'" >&2; exit 1 ;;
-          esac
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -74,8 +34,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ${{ steps.map.outputs.dockerfile }}
+          file: .devops/strix-halo-toolbox-vulkan.Dockerfile
           push: true
           tags: |
-            ${{ env.IMAGE_BASE }}:${{ matrix.backend }}
-            ${{ env.IMAGE_BASE }}:${{ matrix.backend }}-${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
