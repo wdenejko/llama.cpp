@@ -8,7 +8,8 @@
 #     partly the rollback quality bug + older build; stochastic spec sampling adds the rest).
 # Rule: MTP=1 is worth it at any temperature now; TEMP=0 remains the fastest for pure code.
 # Q4_K_XL is the only quant we keep. Creative sampling = unsloth thinking-mode rec.
-# Usage: [QUANT=Q4_K_XL] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1] [FREE_GPU=1] [UBD=512] [KVD=q8_0] [KV=<f16|q8_0>] [MD=<draft.gguf>] [SPEC_STOCH=1] [PMIN=0.75] [RSROLL=0] [BLKTOPK=1]
+# Usage: [QUANT=Q4_K_XL|IQ4_XS] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1] [FREE_GPU=1] [UBD=512] [KVD=q8_0] [KV=<f16|q8_0>] [MD=<draft.gguf>] [SPEC_STOCH=1] [PMIN=0.75] [RSROLL=0] [BLKTOPK=1]
+# QUANT=IQ4_XS = the orcarouter Uncensored finetune (different weights, same arch).
 #   Creative/chat (default):     ./run-flashnext.sh
 #   Fast deterministic code:     MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
 #   Fast reasoning/creative:     MTP=1 ./run-flashnext.sh   (temp 1, stoch spec sampling auto-on)
@@ -69,6 +70,10 @@ FREE_GPU="${FREE_GPU:-1}"            # 1 = stop comfyui/OCR + wait for GTT/RAM h
 
 case "$QUANT" in
   Q4_K_XL) MODEL="$MODELS/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf" ;;
+  # orcarouter Uncensored finetune, IQ4_XS (97.5GB, ~8GB smaller than UD-Q4_K_XL — the margin
+  # that may let ub2048 survive a full 262k fill; validate before trusting deep). MTP draft is
+  # the base model's head: structurally fine (spec verify is lossless), acceptance may dip.
+  IQ4_XS)  MODEL="$HOME/models/Qwen3.8-Flash-Next-Uncensored-GGUF/IQ4_XS/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf" ;;
   *)       MODEL="$MODELS/$QUANT" ;;
 esac
 if [ ! -f "$MODEL" ]; then
