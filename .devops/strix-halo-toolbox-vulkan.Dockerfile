@@ -18,7 +18,7 @@ RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
   git-core patch make ninja-build libcurl-devel nodejs-npm \
   gcc-15.3.1-1.fc43 gcc-c++-15.3.1-1.fc43 cmake-3.31.11-1.fc43 \
   glslc-2026.1-1.fc43 \
-  vulkan-headers-1.4.341.0-1.fc43 \
+  vulkan-headers-1.4.341.0-1.fc43 spirv-headers-devel-1.5.5-37.fc43 \
   vulkan-loader-1.4.341.0-1.fc43 vulkan-loader-devel-1.4.341.0-1.fc43 \
   mesa-vulkan-drivers-25.3.6-3.fc43 vulkaninfo \
   && dnf clean all && rm -rf /var/cache/dnf/*
