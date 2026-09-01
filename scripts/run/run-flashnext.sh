@@ -14,8 +14,11 @@
 #   Fast deterministic code:     MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
 #   Fast reasoning/creative:     MTP=1 ./run-flashnext.sh   (temp 1, stoch spec sampling auto-on)
 export PATH="$PATH:/usr/sbin:/sbin"
-TOOLBOX=llama-nudge-vulkan
-BIN=/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin   # rebased build WITH MTP (old build/ has NO MTP)
+# TOOLBOX/BIN are overridable so the published GHCR image can serve with its own binaries:
+#   TOOLBOX=flashnext BIN=/usr/local/bin ./run-flashnext.sh
+# (image = ghcr.io/wdenejko/llama.cpp/strix-halo-toolbox:vulkan-radv, exact-env pinned)
+TOOLBOX="${TOOLBOX:-llama-nudge-vulkan}"
+BIN="${BIN:-/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin}"   # rebased build WITH MTP (old build/ has NO MTP)
 MODELS=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF
 # remember whether the user pinned these before defaults land — the deep-ctx guard
 # below only auto-picks knobs the user left alone
