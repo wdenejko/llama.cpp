@@ -2564,6 +2564,18 @@ struct ggml_backend_vk_context {
 
     uint64_t last_total_flops {UINT64_MAX};
 
+    // [TAG_JOB_GOVERNOR] adaptive submission clamp. The flops/bytes submit budgets cannot
+    // see ops the estimator prices at zero, and one queued job that runs past the amdgpu
+    // watchdog (~10s) gets its ring reset (observed at deep-context prefill). Stamp each
+    // batch start with a timestamp, learn the max per-submission GPU time, and shrink the
+    // submit budgets when it approaches the budget. Same lifetime as the perf query pool.
+    vk::QueryPool job_query_pool {};
+    uint32_t job_query_count {};
+    uint32_t job_query_idx {};
+    std::vector<int> job_batch_start;   // first node index of each stamped batch
+    double job_clamp {1.0};
+    uint32_t job_log_cooldown {};
+
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
     vk_pipeline_struct * prealloc_y_last_pipeline_used {};
     const ggml_tensor * prealloc_y_last_tensor_used {};
@@ -19707,6 +19719,77 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
+    // [TAG_JOB_GOVERNOR] learn from the previous graph's per-submission timestamps, then
+    // arm this graph's stamping. GGML_VK_JOB_BUDGET_MS tunes the budget (default 2500 ms,
+    // ~4x under the watchdog; 0 disables). GGML_VK_JOB_LOG=1 prints every graph's max job.
+    static const double job_budget_ms = [] {
+        const char * env = getenv("GGML_VK_JOB_BUDGET_MS");
+        return env ? atof(env) : 2500.0;
+    }();
+    static const bool job_log = getenv("GGML_VK_JOB_LOG") != nullptr;
+    const bool job_governor = job_budget_ms > 0.0 && !vk_perf_logger_enabled &&
+                              ctx->device->properties.limits.timestampPeriod > 0.0f;
+    bool job_stamp = job_governor;
+    int job_offender_start = -1;
+    int job_offender_end   = -1;
+    if (job_governor) {
+        if (ctx->job_query_idx > 1) {
+            std::vector<uint64_t> ts(ctx->job_query_idx);
+            vk::Result jres = ctx->device->device.getQueryPoolResults(ctx->job_query_pool, 0, ctx->job_query_idx,
+                    ts.size()*sizeof(uint64_t), ts.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64);
+            if (jres != vk::Result::eSuccess) {
+                // previous graph's stamps not all landed: leave the pool alone, skip this round
+                job_stamp = false;
+            } else {
+                double   max_ms = 0.0;
+                uint32_t max_k  = 0;
+                for (uint32_t k = 1; k < ctx->job_query_idx; ++k) {
+                    const double ms = double(ts[k] - ts[k-1]) * ctx->device->properties.limits.timestampPeriod * 1e-6;
+                    if (ms > max_ms) { max_ms = ms; max_k = k; }
+                }
+                if (job_log) {
+                    GGML_LOG_INFO("ggml_vulkan: [job-governor] prev graph: %u jobs, max %.1f ms (clamp %.2f)\n",
+                            ctx->job_query_idx - 1, max_ms, ctx->job_clamp);
+                }
+                if (max_ms > job_budget_ms) {
+                    // the interval spans the tail of one batch and the head of the next
+                    const int span_lo = ctx->job_batch_start[max_k - 1];
+                    const int span_hi = ctx->job_batch_start[max_k];
+                    const double clamp_new = std::min(ctx->job_clamp * std::min(max_ms/job_budget_ms*1.25, 32.0), 4096.0);
+                    if (clamp_new > ctx->job_clamp) {
+                        GGML_LOG_WARN("ggml_vulkan: [job-governor] a submission ran %.0f ms (budget %.0f, amdgpu watchdog ~10000): nodes ~%d..%d; submit budgets /%.1f\n",
+                                max_ms, job_budget_ms, span_lo, span_hi, clamp_new);
+                        ctx->job_clamp = clamp_new;
+                        if (ctx->job_log_cooldown == 0) {
+                            // graphs share their structure across ubatches, so this graph's
+                            // nodes at the same indices name the slow span
+                            job_offender_start = span_lo;
+                            job_offender_end   = span_hi;
+                            ctx->job_log_cooldown = 64;
+                        }
+                    }
+                } else if (max_ms < 0.5*job_budget_ms && ctx->job_clamp > 1.0) {
+                    ctx->job_clamp = std::max(1.0, ctx->job_clamp * 0.95);
+                }
+            }
+        }
+        if (ctx->job_log_cooldown > 0) {
+            ctx->job_log_cooldown--;
+        }
+        if (job_stamp) {
+            if (!ctx->job_query_pool) {
+                vk::QueryPoolCreateInfo job_qci;
+                job_qci.queryType  = vk::QueryType::eTimestamp;
+                job_qci.queryCount = 4096;
+                ctx->job_query_pool  = ctx->device->device.createQueryPool(job_qci);
+                ctx->job_query_count = job_qci.queryCount;
+            }
+            ctx->device->device.resetQueryPool(ctx->job_query_pool, 0, ctx->job_query_count);
+            ctx->job_query_idx = 0;
+            ctx->job_batch_start.clear();
+        }
+    }
+
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_k_padded = false;
@@ -19739,6 +19822,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
     }
     uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    uint32_t max_nodes_per_submit = ctx->device->max_nodes_per_submit;
+    // [TAG_JOB_GOVERNOR] shrink both budgets while measured job times run hot
+    if (job_governor && ctx->job_clamp > 1.0) {
+        flops_per_submit     = std::max<uint64_t>(uint64_t(double(flops_per_submit) / ctx->job_clamp), 1'000'000'000ULL);
+        max_nodes_per_submit = std::max<uint32_t>(uint32_t(double(max_nodes_per_submit) / ctx->job_clamp), 2u);
+    }
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -19765,13 +19854,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         submitted_nodes = 0;
         batch_flops = 0;
         batch_bytes = 0;
-        if (submit_count < 3) {
+        if (submit_count < 3 && !(job_governor && ctx->job_clamp > 1.0)) {
             flops_per_submit *= 2;
         }
         submit_count++;
     };
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        // [TAG_JOB_GOVERNOR] deferred pinpoint: name the slow span found in the previous
+        // graph using this graph's identically-indexed nodes
+        if (i == job_offender_start) {
+            GGML_LOG_WARN("ggml_vulkan: [job-governor] slow-span nodes (same indices, this graph):\n");
+            ggml_vk_print_node_list(cgraph, job_offender_start, std::min(job_offender_end, job_offender_start + 48));
+        }
         if (first_node_in_batch) {
             submit_node_idx = i;
         }
@@ -20060,7 +20155,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+        bool submit = (submitted_nodes >= max_nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (ctx->device->max_bytes_per_submit != 0 && batch_bytes >= ctx->device->max_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
@@ -20090,6 +20185,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 #ifndef GGML_VULKAN_CHECK_RESULTS
             if (first_node_in_batch) {
                 first_node_in_batch = false;
+                // [TAG_JOB_GOVERNOR] one stamp per batch; interval k-1 -> k measures the
+                // tail of batch k-1 plus the head of batch k, so intervals tile the graph
+                if (job_stamp && ctx->job_query_idx < ctx->job_query_count) {
+                    compute_ctx = ggml_vk_get_compute_ctx(ctx);
+                    compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->job_query_pool, ctx->job_query_idx++);
+                    ctx->job_batch_start.push_back(submit_node_idx);
+                }
             }
 #endif
         }
