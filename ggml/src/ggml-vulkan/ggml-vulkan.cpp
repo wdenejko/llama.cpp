@@ -19748,7 +19748,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     if (ms > max_ms) { max_ms = ms; max_k = k; }
                 }
                 if (job_log) {
-                    GGML_LOG_INFO("ggml_vulkan: [job-governor] prev graph: %u jobs, max %.1f ms (clamp %.2f)\n",
+                    // fprintf, not GGML_LOG_INFO: llama-server's default log callback drops
+                    // backend INFO lines, which made the governor invisible in server logs
+                    fprintf(stderr, "ggml_vulkan: [job-governor] prev graph: %u jobs, max %.1f ms (clamp %.2f)\n",
                             ctx->job_query_idx - 1, max_ms, ctx->job_clamp);
                 }
                 if (max_ms > job_budget_ms) {
@@ -19862,10 +19864,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         // [TAG_JOB_GOVERNOR] deferred pinpoint: name the slow span found in the previous
-        // graph using this graph's identically-indexed nodes
+        // graph using this graph's identically-indexed nodes. fprintf, not GGML_LOG_CONT:
+        // llama-server's default log callback drops CONT/INFO backend lines
         if (i == job_offender_start) {
-            GGML_LOG_WARN("ggml_vulkan: [job-governor] slow-span nodes (same indices, this graph):\n");
-            ggml_vk_print_node_list(cgraph, job_offender_start, std::min(job_offender_end, job_offender_start + 48));
+            fprintf(stderr, "ggml_vulkan: [job-governor] slow-span nodes (same indices, this graph):\n");
+            for (int j = job_offender_start; j <= std::min(job_offender_end, job_offender_start + 48) && j < cgraph->n_nodes; j++) {
+                fprintf(stderr, "  node %d: %s (%s) [%.2f GFLOP]\n", j, cgraph->nodes[j]->name,
+                        ggml_op_name(cgraph->nodes[j]->op), ggml_vk_get_node_flops(cgraph->nodes[j]) / 1e9);
+            }
         }
         if (first_node_in_batch) {
             submit_node_idx = i;
