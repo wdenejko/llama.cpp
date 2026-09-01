@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # run-flashnext.sh — serve Qwen3.8-Flash-Next on Strix Halo (Vulkan/RADV).
 #
-#   chat:          MTP=1 ./run-flashnext.sh
-#   code (fast):   MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
-#   full context:  MTP=1 CTX=262144 ./run-flashnext.sh   (deep-ctx guard auto-configures)
+#   chat:          MTP=1 ./run-flashnext.sh              (full 262k context by default;
+#   code (fast):   MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh    the guard auto-tiers)
+#   smaller ctx:   CTX=131072 ./run-flashnext.sh         (skips the deep-ctx knobs)
 #   image build:   BIN=/usr/local/bin ./run-flashnext.sh (serve the GHCR image's binaries)
 #
 # Every default below is measured; the rationale lives in the published release notes
@@ -28,7 +28,7 @@ MDQ4=/home/wdenejko/models/Qwen3.8-Flash-Next-MTP-Q8_0-GGUF/Qwen3.8-Flash-Next-M
 QUANT="${QUANT:-Q4_K_XL}"            # Q4_K_XL (base) | IQ4_XS (orcarouter Uncensored finetune)
 PORT="${PORT:-8080}"
 NGL="${NGL:-99}"
-CTX="${CTX:-131072}"                 # up to 262144
+CTX="${CTX:-262144}"                 # full model context; the deep-ctx guard below keeps it safe
 FA="${FA:-on}"
 NGRAM_OFFLOAD="${NGRAM_OFFLOAD:-1}"  # 1 = keep the 28.8GB PLE table on CPU (needed at big ctx)
 REASONING="${REASONING:-medium}"     # xhigh|medium|low = think at that effort; none/off = think OFF
