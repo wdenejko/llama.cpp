@@ -88,6 +88,12 @@ OT_ARGS=()
 # raise_exception()s on anything else. Thinking is turned OFF by enable_thinking=false, which the server
 # flag `--reasoning off` sets (verified: yields an empty <think></think> and pure output, no error).
 # So 'none'/'off' -> `--reasoning off`; any other value -> a real effort level.
+# The Uncensored finetune's template enforces the effort enum (xhigh is ITS default) and
+# raise_exception()s on 'high'. Remap so the muscle-memory REASONING=high still boots.
+if [ "$QUANT" = "IQ4_XS" ] && [ "$REASONING" = "high" ]; then
+  REASONING=xhigh
+  echo "[run-flashnext] IQ4_XS template: reasoning high -> xhigh (this template's levels: xhigh|medium|low)" >&2
+fi
 REASON_ARGS=()
 case "$REASONING" in
   none|off|0) REASON_ARGS=(--reasoning off) ;;
