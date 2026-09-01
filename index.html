@@ -126,13 +126,7 @@
   <div class="wrap masthead">
     <div class="eyebrow"><b>Release notes · 2026-09-01</b> · gfx1151 / RDNA3.5 · Vulkan/RADV · Qwen3.8-Flash-Next (qwen4exp) · branch flashnext-v2</div>
     <h1>Flash-Next on Strix Halo</h1>
-    <p class="lede">A llama.cpp fork tuned for running <b>Qwen3.8-Flash-Next</b> on AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S, 128&nbsp;GB unified memory). This page lists everything that shipped, what each change is worth, what we tried that failed, and how to reproduce the numbers — including the full-context (262k) enablement and the complete 2k→252k benchmark curves. Every claim comes from an A/B on the target machine.</p>
-    <div class="stats">
-      <div class="stat"><div class="n win">2–4×</div><div class="l">decode vs. mainline at temp 0 (42 vs 25 t/s shallow, 34 vs 15 at 32k, ~40 vs 8–9 at 96k)</div></div>
-      <div class="stat"><div class="n win">+21%</div><div class="l">prefill over the fork's own starting point (543 → 660 t/s, batch 2048)</div></div>
-      <div class="stat"><div class="n win">262k</div><div class="l">full context on one 128 GB APU — a complete 252k fill validated at 209 t/s average prefill</div></div>
-      <div class="stat"><div class="n win">28.9 t/s</div><div class="l">decode with the context filled to 252k (speculative, production sampling)</div></div>
-    </div>
+    <p class="lede">A llama.cpp fork tuned for running <b>Qwen3.8-Flash-Next</b> on AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S, 128&nbsp;GB unified memory). This page lists everything that shipped, what each change is worth, what we tried that failed, what's still open, and how to reproduce the numbers — including the full-context (262k) enablement and the complete 2k→252k benchmark curves. Every claim comes from an A/B on the target machine.</p>
   </div>
 </header>
 
@@ -238,7 +232,7 @@
     <h3>Two ceilings, precisely mapped</h3>
     <ul>
       <li><b>The base model's ub2048 ceiling is memory:</b> host OOM at ~192k of fill (see above).</li>
-      <li><b>IQ4_XS's ub2048 ceiling is a GPU watchdog, not memory:</b> with RAM to spare, prefill deterministically dies at ~227k — an <span class="knob">amdgpu ring timeout</span>, reproduced twice on different ring instances. A single compute dispatch (prime suspect: gathered sparse attention at [union&nbsp;×&nbsp;batch] scale) crosses the ~10&nbsp;s watchdog; the base model at UB=1024 runs 0.57× that dispatch size and always passed. The fix is splitting that dispatch — kernel work, tracked. Until then the launcher's automatic UB=1024 step above 192k applies to this quant too.</li>
+      <li><b>IQ4_XS's ub2048 ceiling is a GPU watchdog, not memory — and it's now root-caused:</b> with RAM to spare, prefill deterministically dies at ~227k with an <span class="knob">amdgpu ring timeout</span>, reproduced across runs. The cause is <b>a submission-concurrency hazard, not a single slow kernel</b>: forcing one submission in flight at a time (<span class="knob">GGML_VK_SERIALIZE_SUBMISSIONS=1</span>) makes the exact killer config complete a full 200k prefill+decode cleanly, where the overlapped run wedges the ring at ~194k. It fits the <span class="knob">signaled&nbsp;N&nbsp;/&nbsp;emitted&nbsp;N+2</span> dmesg signature and explains why UB=1024 survives with full overlap (its smaller submissions stay under the threshold). <b>Resolved by the guard, which is already optimal:</b> its automatic UB=1024 step above 192k is both safe and <em>faster</em> than a serialized-ub2048 workaround — measured <span class="num">209 t/s (ub1024)</span> vs <span class="num">160 t/s (serialized ub2048)</span> at 200k. So ub2048 at full depth is a losing trade even when made to work; the fast path was already the one shipping. (Two earlier theories — an oversized dispatch, then bounding in-flight submissions to two — were both disproven on the box.)</li>
       <li><b>Spending the headroom doesn't buy prefill:</b> A/B-tested moving the 27.5&nbsp;GB per-layer-embedding table back to the GPU (a wash — and the placement flag proved inert: the tensor stays in an anonymous host buffer either way) and UB=3072 (flat to slightly negative). The headroom's real value is fill safety and zero swap. Also settled an old mystery: the "cold PLE" prefill tax on the base model was <em>anonymous-page swap under RAM pressure</em>, not page-cache misses — on this quant it simply doesn't exist.</li>
       <li><b>Template quirk:</b> the finetune's chat template enforces reasoning efforts <span class="knob">xhigh|medium|low</span> (xhigh is its default) and rejects <span class="knob">high</span>; the launcher remaps automatically.</li>
     </ul>
@@ -314,6 +308,17 @@
     <p>The branch tracks ggml-org master by merge; the latest sync brings in 54 commits including upstream's own Flash-Next work (radix top-k for k ≥ 1024, mat-vec tuning for Strix Halo, fewer graph splits in qwen4exp) alongside this fork's machinery. Where the two overlap — upstream's row-ID hoisting is nearly the same prepass as ours — both paths coexist and the fork's validated defaults stay in charge.</p>
     <p>Validated on-box against the pre-merge build with the identical bench script: recall, stability, and draft acceptance are unchanged (needles 3/3, harness 10/10, acceptance 0.871 vs 0.873); prefill is equal or better through 32k; shallow decode gains <span class="num">+6.7%</span> (upstream's RDNA3 mat-vec dispatch wins on this APU too — <span class="knob">GGML_VK_RDNA3_MMV_TUNE=0</span> reverts). One residual: decode at 32k reads −6.6%, of which ~2 points trace to a slower single-token flash-attention dispatch (222&nbsp;→&nbsp;257&nbsp;µs at 33k KV, same shape). The working branch runs the fully-validated pre-merge state; the merged tree is preserved on <span class="knob">flashnext-v2-merged</span> with the depth-decode residual as the open item before re-adoption.</p>
   </div>
+
+  <div class="card">
+    <h3>Tooling, packaging &amp; diagnostics<span class="tag fx">infra</span></h3>
+    <ul>
+      <li><b>Full context is the default.</b> The launcher now serves the whole 262k context out of the box; the deep-context guard makes the maximum safe automatically (Q4 draft, KV=q8_0, UB=1024 at depth). <span class="knob">CTX=131072</span> narrows it.</li>
+      <li><b>One reproducible toolbox image.</b> A single CI-built container — <span class="knob">ghcr.io/wdenejko/llama.cpp/llama-vulkan-wdenejko</span> — pins the exact environment these numbers were measured in (Fedora&nbsp;43, gcc&nbsp;15.3.1, Mesa&nbsp;25.3.6 RADV, znver5). Its binaries serve at parity with the box build (<span class="num">596.8 vs 596.5</span> t/s at 2k, decode identical), so what the community pulls is what the box runs.</li>
+      <li><b>Launcher, unbloated.</b> <span class="knob">run-flashnext.sh</span> refactored 277&nbsp;→&nbsp;193 lines with the behavior proven byte-identical (comment-stripped, continuation-joined token streams diff empty).</li>
+      <li><b>Job-time telemetry that survives a hung graph.</b> <span class="knob">GGML_VK_JOB_LOG=1</span> reports per-submission GPU time; <span class="knob">GGML_VK_SUBMIT_TRACE=1</span> prints each submission's ops as it is dispatched, flushed — the one instrument that can name the culprit when a graph never returns (timestamp read-back can't). This is what root-caused the ub2048 ring hang as a concurrency hazard rather than a slow kernel.</li>
+      <li><b>Uncensored IQ4_XS template fix.</b> The finetune's chat template rejected mid-conversation system messages, which agent harnesses (e.g. opencode) send routinely — every such request 500'd. A relaxed copy renders them in place, byte-identical on normal inputs. <span class="knob">TPLFIX=0</span> reverts.</li>
+    </ul>
+  </div>
 </section>
 
 <section>
@@ -331,6 +336,32 @@
       <tr><td>KV-cache quantization for speed</td><td class="r">wash</td><td>36 of 48 layers are recurrent and hold no KV, so q8_0 buys no throughput — but the same wash later became the deep-context <em>fit</em> lever: −3.9 GB of host RAM is what lets 262k boot with the fast batch tier.</td></tr>
       <tr><td>Micro-batch 3072, f16-B dense sweep, driver flags</td><td class="r">flat / −2%</td><td>Swept with engagement evidence; nothing reproduced.</td></tr>
     </table>
+  </div>
+</section>
+
+<section>
+  <h2>Roadmap — what's open</h2>
+  <p class="sec-sub">The honest current queue. Ranked by payoff; each is measured or scoped, none are speculative wishlist items.</p>
+
+  <div class="card">
+    <h3>In progress</h3>
+    <ul>
+      <li><b>Agentic coding eval (pi-bench).</b> Throughput is only half the story — this measures the served model as an actual coding agent on SWE-bench-style tasks (clone a repo, fix a real bug, run its test suite), scored by an independent cloud LLM judge. Agent runs on the local model, judge in the cloud so it never contends for the single serving slot. Results to be added here.</li>
+      <li><b>IQ4_XS depth-tax profile.</b> The i-quant's prefill trails the base quant by an amount that <em>grows</em> with depth (−5% shallow, parity to 96k, then −21% at 160k / −29% at 192k) while decode stays at parity — backwards from what weight-dequant cost predicts, so something KV/attention-adjacent responds to the quant. One <span class="knob">GGML_VK_PERF_LOGGER</span> session at 128–192k names the dispatch; then it's a targeted i-quant kernel fix or a documented envelope.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Open perf levers</h3>
+    <ul>
+      <li><b>Expert-GEMM latency structure.</b> The MoE matmuls are the hardest problem on this GPU (~34% of prefill, latency-bound not bandwidth-bound). Ranked next attempts: <span class="knob">mul_mat_id</span> BK64, epilogue-fusion phase&nbsp;B (fuse the MUL-by-tensor routing weight into the tile store), and flash-attention-at-depth tuning. Each is expected to be small and additive, in keeping with everything shipped in this area.</li>
+      <li><b>ub2048 concurrent at depth (low priority).</b> The ub2048 ring hang is resolved — the guard's UB=1024 is safe and already faster at depth. The only remaining upside is hunting the specific unsynchronized buffer so ub2048 could run with full overlap instead of falling back, worth ~5% deep-prefill at best and uncertain kernel-debugging work. Parked behind the profiling above.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Before upstream re-adoption</h3>
+    <p>The ggml-org merge is built and validated on <span class="knob">flashnext-v2-merged</span> (correctness clean, acceptance matched). The one open item blocking re-adoption on the working branch is the <span class="num">−6.6%</span> decode-at-32k residual, ~2 points of which trace to a slower single-token flash-attention dispatch at 33k KV — chase that kernel, then re-merge.</p>
   </div>
 </section>
 
@@ -371,7 +402,7 @@ toolbox create llama-vulkan-wdenejko --image ghcr.io/wdenejko/llama.cpp/llama-vu
 
 <footer>
   <div class="wrap" style="padding:0">
-    Measured on: Ryzen AI MAX+ 395 (Strix Halo), Radeon 8060S (gfx1151, 40 CU), 128 GB LPDDR5X, Fedora 42, Mesa 25.3.6 RADV · model Qwen3.8-Flash-Next UD-Q4_K_XL.<br>
+    Measured on: Ryzen AI MAX+ 395 (Strix Halo), Radeon 8060S (gfx1151, 40 CU), 128 GB LPDDR5X, Fedora 43 toolbox, Mesa 25.3.6 RADV · models Qwen3.8-Flash-Next UD-Q4_K_XL and orcarouter Uncensored IQ4_XS.<br>
     Related upstream work: #27742 (qwen4exp), #28032 (radix top-k), #27909 (Strix mat-vec tuning), #26686 (row-ID hoisting), #27925 (mul_mat_id K padding), #27880 (graph splits).
   </div>
 </footer>
@@ -465,7 +496,7 @@ function render() {
     const dpp = ai >= 0 ? (100 * (C.pp[i] - A.pp[ai]) / A.pp[ai]).toFixed(1) + "%" : "—";
     iqrows += `<tr><td>${fmtK(d)}</td><td>${C.pp[i].toFixed(1)}</td><td>${ai >= 0 ? A.pp[ai].toFixed(1) : "—"}</td><td>${dpp}</td><td>${C.tg[i].toFixed(1)}</td><td>${ai >= 0 ? A.tg[ai].toFixed(1) : "—"}</td></tr>`;
   });
-  iqrows += `<tr><td>224k</td><td colspan="5" style="text-align:left;color:var(--bad);font-weight:600">✗ deterministic amdgpu ring timeout at ~227k (2× reproduced) — GPU watchdog, not memory</td></tr>`;
+  iqrows += `<tr><td>224k</td><td colspan="5" style="text-align:left;color:var(--bad);font-weight:600">✗ ub2048 ring-timeout ~227k (concurrency hazard, root-caused) — the guard steps to UB=1024 here, which walks the full context and is faster anyway</td></tr>`;
   iqtb.innerHTML = iqrows;
 
   const tb = document.getElementById("tbody");
