@@ -84,6 +84,12 @@ case "$REASONING" in
   *)          REASON_ARGS=(--reasoning on --reasoning-effort "$REASONING") ;;
 esac
 
+# the Uncensored template rejects mid-conversation system messages (agent harnesses like
+# opencode send them); serve a relaxed copy that renders them in place. TPLFIX=0 reverts.
+TPL="${TPL:-/home/wdenejko/src/llama-qwen4exp-src/scripts/run/uncensored-chat-template.jinja}"
+TPL_ARGS=()
+[ "$QUANT" = "IQ4_XS" ] && [ "${TPLFIX:-1}" != "0" ] && [ -f "$TPL" ] && TPL_ARGS=(--chat-template-file "$TPL")
+
 MTP_ARGS=()
 VK_ENV=()
 [ "$COOPMAT" = "0" ] && VK_ENV=(GGML_VK_DISABLE_COOPMAT=1)
@@ -189,5 +195,5 @@ toolbox run --container "$TOOLBOX" env "${VK_ENV[@]}" LD_LIBRARY_PATH="$BIN" \
     --parallel "$PARALLEL" \
     --temp "$TEMP" --top-p 0.95 --top-k 20 --min-p 0.0 \
     --presence-penalty 0.0 --repeat-penalty 1.0 \
-    "${REASON_ARGS[@]}" \
+    "${REASON_ARGS[@]}" "${TPL_ARGS[@]}" \
     "${MTP_ARGS[@]}"
