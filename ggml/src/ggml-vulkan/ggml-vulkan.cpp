@@ -2575,6 +2575,13 @@ struct ggml_backend_vk_context {
     std::vector<int> job_batch_start;   // first node index of each stamped batch
     double job_clamp {1.0};
     uint32_t job_log_cooldown {};
+    // in-flight throttle: the amdgpu watchdog times a job from emission, queue-wait
+    // included, so 3+ multi-second jobs pending together reset the ring at deep context.
+    // When jobs run big, wait the submission two back before submitting the next.
+    vk::Fence job_throttle_fence[2] {};
+    bool     job_throttle_pending[2] {};
+    uint32_t job_throttle_idx {};
+    bool     job_throttle_active {};
 
     // Cache most recent tensor that was converted into prealloc_y, and what pipeline it used to convert.
     vk_pipeline_struct * prealloc_y_last_pipeline_used {};
@@ -18182,6 +18189,26 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
         } else if (almost_ready && !ctx->almost_ready_fence_pending) {
             ggml_vk_submit(subctx, ctx->almost_ready_fence);
             ctx->almost_ready_fence_pending = true;
+        } else if (ctx->job_throttle_active && ctx->job_throttle_fence[0]) {
+            // [TAG_JOB_GOVERNOR] bound in-flight submissions to 2: wait the one two
+            // submits back, so a job's ring residency stays ~2x the largest job time
+            const uint32_t slot = ctx->job_throttle_idx & 1u;
+            bool slot_free = !ctx->job_throttle_pending[slot];
+            if (!slot_free) {
+                auto tres = ctx->device->device.waitForFences({ ctx->job_throttle_fence[slot] }, true, 30ull*1000*1000*1000);
+                if (tres == vk::Result::eSuccess) {
+                    ctx->device->device.resetFences({ ctx->job_throttle_fence[slot] });
+                    ctx->job_throttle_pending[slot] = false;
+                    slot_free = true;
+                }
+            }
+            if (slot_free) {
+                ggml_vk_submit(subctx, ctx->job_throttle_fence[slot]);
+                ctx->job_throttle_pending[slot] = true;
+                ctx->job_throttle_idx++;
+            } else {
+                ggml_vk_submit(subctx, {});
+            }
         } else {
             ggml_vk_submit(subctx, {});
         }
@@ -19750,8 +19777,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 if (job_log) {
                     // fprintf, not GGML_LOG_INFO: llama-server's default log callback drops
                     // backend INFO lines, which made the governor invisible in server logs
-                    fprintf(stderr, "ggml_vulkan: [job-governor] prev graph: %u jobs, max %.1f ms (clamp %.2f)\n",
-                            ctx->job_query_idx - 1, max_ms, ctx->job_clamp);
+                    fprintf(stderr, "ggml_vulkan: [job-governor] prev graph: %u jobs, max %.1f ms (clamp %.2f throttle %d)\n",
+                            ctx->job_query_idx - 1, max_ms, ctx->job_clamp, ctx->job_throttle_active ? 1 : 0);
+                }
+                // in-flight throttle hysteresis: prefill depth grows jobs smoothly, so this
+                // engages long before residency (~2-3 jobs deep) can cross the ~10s watchdog
+                if (max_ms > 500.0 && !ctx->job_throttle_active) {
+                    ctx->job_throttle_active = true;
+                    fprintf(stderr, "ggml_vulkan: [job-governor] jobs at %.0f ms: bounding in-flight submissions to 2 (watchdog residency guard)\n", max_ms);
+                } else if (max_ms < 250.0 && ctx->job_throttle_active) {
+                    ctx->job_throttle_active = false;
                 }
                 if (max_ms > job_budget_ms) {
                     // the interval spans the tail of one batch and the head of the next
@@ -19785,11 +19820,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 job_qci.queryCount = 4096;
                 ctx->job_query_pool  = ctx->device->device.createQueryPool(job_qci);
                 ctx->job_query_count = job_qci.queryCount;
+                ctx->job_throttle_fence[0] = ctx->device->device.createFence({});
+                ctx->job_throttle_fence[1] = ctx->device->device.createFence({});
             }
             ctx->device->device.resetQueryPool(ctx->job_query_pool, 0, ctx->job_query_count);
             ctx->job_query_idx = 0;
             ctx->job_batch_start.clear();
         }
+    } else {
+        ctx->job_throttle_active = false;
     }
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
