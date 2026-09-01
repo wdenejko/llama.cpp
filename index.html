@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash-Next on Strix Halo</title>
+<meta name="description" content="Release notes and benchmarks for a llama.cpp fork tuned for Qwen3.8-Flash-Next on AMD Strix Halo (gfx1151, Vulkan/RADV, 128 GB unified memory).">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --bg:#e9ecf1; --surface:#fbfcfd; --surface-2:#f1f4f8; --inset:#eaeef3;
+    --ink:#171a21; --ink-muted:#565f6d; --ink-faint:#8891a0;
+    --border:#d7dce4; --border-strong:#c2c9d4;
+    --accent:#b0561f; --accent-ink:#8a4013; --accent-soft:rgba(176,86,31,.10);
+    --prefill:#2f5aa8; --prefill-soft:rgba(47,90,168,.11);
+    --decode:#0d7a68; --decode-soft:rgba(13,122,104,.12);
+    --measured:#1f8a4c; --bad:#a33b3b;
+    --shadow:0 1px 2px rgba(20,24,33,.04),0 4px 16px rgba(20,24,33,.05);
+    --radius:14px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0f1216; --surface:#171b22; --surface-2:#1c212a; --inset:#12161c;
+      --ink:#e7ebf1; --ink-muted:#a3adbc; --ink-faint:#6b7686;
+      --border:#282f3a; --border-strong:#38414f;
+      --accent:#e08a4f; --accent-ink:#e6a071; --accent-soft:rgba(224,138,79,.13);
+      --prefill:#6f9be6; --prefill-soft:rgba(111,155,230,.14);
+      --decode:#38b7a0; --decode-soft:rgba(56,183,160,.14);
+      --measured:#46c07a; --bad:#e07a7a;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 22px rgba(0,0,0,.34);
+    }
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
+    font-size:16px; line-height:1.6; letter-spacing:-.006em;
+    -webkit-font-smoothing:antialiased;
+  }
+  .mono{font-family:"IBM Plex Mono",ui-monospace,Menlo,monospace}
+  .wrap{max-width:980px; margin:0 auto; padding:0 24px}
+  a{color:var(--accent-ink); text-decoration:none; border-bottom:1px solid var(--accent-soft)}
+  a:hover{border-bottom-color:var(--accent)}
+  :focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:3px}
+
+  header{border-bottom:1px solid var(--border); background:linear-gradient(180deg,var(--surface-2),transparent)}
+  .masthead{padding:40px 0 30px}
+  .eyebrow{font-family:"IBM Plex Mono",monospace; font-size:12.5px; font-weight:500;
+    letter-spacing:.12em; text-transform:uppercase; color:var(--ink-faint);
+    display:flex; gap:12px; flex-wrap:wrap}
+  .eyebrow b{color:var(--accent-ink); font-weight:600}
+  h1{font-size:clamp(30px,5vw,44px); line-height:1.05; font-weight:700;
+    letter-spacing:-.028em; margin:.5rem 0 .1rem; text-wrap:balance}
+  .lede{font-size:clamp(16.5px,2.2vw,19px); color:var(--ink-muted); max-width:64ch;
+    margin:.7rem 0 0; text-wrap:pretty}
+  .lede b{color:var(--ink); font-weight:600}
+
+  .stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+    gap:1px; background:var(--border); border:1px solid var(--border);
+    border-radius:var(--radius); overflow:hidden; margin:26px 0 6px}
+  .stat{background:var(--surface); padding:15px 18px}
+  .stat .n{font-family:"IBM Plex Mono",monospace; font-size:25px; font-weight:600;
+    letter-spacing:-.02em; font-variant-numeric:tabular-nums; line-height:1.1}
+  .stat .n.win{color:var(--measured)}
+  .stat .l{font-size:12.5px; color:var(--ink-muted); margin-top:3px; line-height:1.35}
+
+  section{padding:30px 0 4px}
+  h2{font-size:22px; font-weight:600; letter-spacing:-.02em; margin:0 0 4px}
+  .sec-sub{color:var(--ink-muted); margin:2px 0 16px; max-width:74ch}
+  h3{font-size:16.5px; font-weight:600; letter-spacing:-.015em; margin:0 0 6px}
+
+  .card{background:var(--surface); border:1px solid var(--border);
+    border-radius:var(--radius); box-shadow:var(--shadow); padding:20px 22px; margin-bottom:14px}
+  .card p{margin:.45rem 0; color:var(--ink-muted); font-size:14.8px}
+  .card p b{color:var(--ink); font-weight:600}
+  .card ul{margin:.4rem 0 .2rem; padding-left:1.15rem; color:var(--ink-muted); font-size:14.8px}
+  .card li{margin:.35rem 0}
+  .card li b{color:var(--ink); font-weight:600}
+  .num{font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums;
+    color:var(--measured); font-weight:600; font-size:13.5px}
+  .knob{font-family:"IBM Plex Mono",monospace; font-size:12.3px; color:var(--accent-ink);
+    background:var(--inset); border:1px solid var(--border); border-radius:6px; padding:1px 6px; white-space:nowrap}
+
+  .tag{display:inline-block; font-family:"IBM Plex Mono",monospace; font-size:10.5px;
+    font-weight:600; letter-spacing:.07em; text-transform:uppercase; padding:2px 8px;
+    border-radius:6px; color:#fff; vertical-align:2px; margin-left:8px}
+  .tag.pf{background:var(--prefill)} .tag.dc{background:var(--decode)} .tag.fx{background:var(--accent)}
+
+  .tablewrap{overflow-x:auto}
+  table{width:100%; border-collapse:collapse; font-size:14px; font-variant-numeric:tabular-nums}
+  th{text-align:right; font-weight:600; color:var(--ink-muted); font-size:12.3px;
+    text-transform:uppercase; letter-spacing:.05em; padding:6px 11px;
+    border-bottom:1px solid var(--border); white-space:nowrap}
+  th:first-child,td:first-child{text-align:left}
+  td{padding:6px 11px; text-align:right; border-bottom:1px dashed var(--border);
+    font-family:"IBM Plex Mono",monospace; font-size:13.3px}
+  td:first-child{font-family:"IBM Plex Sans",sans-serif; font-size:14px}
+  tr:last-child td{border-bottom:0}
+  td.good{color:var(--measured); font-weight:600}
+  td.bad{color:var(--bad); font-weight:600}
+  .fn{color:var(--ink-faint); font-size:12.5px; margin-top:9px}
+
+  .dead td{font-family:"IBM Plex Sans",sans-serif; font-size:14px; text-align:left}
+  .dead td.r{font-family:"IBM Plex Mono",monospace; color:var(--bad); white-space:nowrap; font-size:13px}
+
+  pre{background:var(--inset); border:1px solid var(--border); border-radius:10px;
+    padding:13px 16px; overflow-x:auto; font-family:"IBM Plex Mono",monospace;
+    font-size:13px; line-height:1.55; color:var(--ink); margin:.6rem 0}
+  pre .c{color:var(--ink-faint)}
+
+  .legend{display:flex; gap:18px; flex-wrap:wrap; font-size:13px; color:var(--ink-muted); padding:2px 4px 10px}
+  .legend span{display:inline-flex; align-items:center; gap:7px}
+  .swatch{width:18px; height:3px; border-radius:2px; display:inline-block}
+  svg.chart{width:100%; height:auto; display:block}
+
+  footer{border-top:1px solid var(--border); margin-top:30px; padding:24px 0 46px;
+    color:var(--ink-faint); font-size:13px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap masthead">
+    <div class="eyebrow"><b>Release notes · 2026-09-01</b> · gfx1151 / RDNA3.5 · Vulkan/RADV · Qwen3.8-Flash-Next (qwen4exp) · branch flashnext-v2</div>
+    <h1>Flash-Next on Strix Halo</h1>
+    <p class="lede">A llama.cpp fork tuned for running <b>Qwen3.8-Flash-Next</b> on AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S, 128&nbsp;GB unified memory). This page lists everything that shipped, what each change is worth, what we tried that failed, and how to reproduce the numbers — including the full-context (262k) enablement and the complete 2k→252k benchmark curves. Every claim comes from an A/B on the target machine.</p>
+    <div class="stats">
+      <div class="stat"><div class="n win">2–4×</div><div class="l">decode vs. mainline at temp 0 (42 vs 25 t/s shallow, 34 vs 15 at 32k, ~40 vs 8–9 at 96k)</div></div>
+      <div class="stat"><div class="n win">+21%</div><div class="l">prefill over the fork's own starting point (543 → 660 t/s, batch 2048)</div></div>
+      <div class="stat"><div class="n win">262k</div><div class="l">full context on one 128 GB APU — a complete 252k fill validated at 209 t/s average prefill</div></div>
+      <div class="stat"><div class="n win">28.9 t/s</div><div class="l">decode with the context filled to 252k (speculative, production sampling)</div></div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+<section>
+  <h2>The model and the machine</h2>
+  <div class="card">
+    <p>Qwen3.8-Flash-Next is a hybrid: 48 layers, of which 36 are gated-delta-net recurrent layers and 12 are sparse-attention (QSA) layers that select the top 2048 KV cells per token with a learned indexer. It has a 512-expert MoE (10 active per token), 4-wide hyper-connections instead of a plain residual stream, per-layer embeddings, and a built-in MTP head for self-speculative decoding. Weights are UD-Q4_K_XL (~103 GB loaded).</p>
+    <p>Strix Halo pairs 40 RDNA3.5 CUs with 128 GB of unified LPDDR5X at ~256 GB/s. We run Vulkan/RADV rather than ROCm: on this APU Vulkan wins decode by 18–35%, and ROCm 10's gains target datacenter parts. Decode is memory-bandwidth-bound (the fork reaches ~80% of peak DRAM bandwidth); prefill is compute- and latency-bound, which is where most of the kernel work below lives.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Headline results</h2>
+  <p class="sec-sub">Measured on the current branch. Prefill is the marginal rate over the trailing ~6k tokens at each depth; decode is 128 greedy tokens. "MTP" is the model's own draft head doing speculative decoding.</p>
+  <div class="card tablewrap">
+    <table>
+      <tr><th>Depth</th><th>Prefill (t/s)</th><th>Prefill, MTP</th><th>Decode (t/s)</th><th>Decode, MTP</th><th>Accept</th></tr>
+      <tr><td>2k</td><td>653</td><td>586</td><td>25.4</td><td class="good">31.7</td><td>82%</td></tr>
+      <tr><td>8k</td><td>597</td><td>537</td><td>24.5</td><td class="good">47.8</td><td>92%</td></tr>
+      <tr><td>32k</td><td>464</td><td>424</td><td>22.1</td><td class="good">47.6</td><td>96%</td></tr>
+      <tr><td>64k</td><td>373</td><td>338</td><td>20.0</td><td class="good">43.5</td><td>95%</td></tr>
+      <tr><td>128k</td><td>267</td><td>219*</td><td>17.0</td><td class="good">30.6*</td><td>85%</td></tr>
+    </table>
+    <p class="fn">* 128k with MTP needs the Q4 draft and a small draft micro-batch to fit host RAM; the Q8 draft runs out of memory past ~120k of context. Acceptance, and therefore MTP decode speed, depends on content — these runs continue source code. At temp 1, stochastic speculative sampling keeps MTP worthwhile: 37.9 t/s mean vs ~26 without.</p>
+  </div>
+  <div class="card">
+    <p>For scale: mainline llama.cpp on the same machine decodes this model at ~25 t/s shallow, 15 t/s at 32k, and 8–9 t/s past 90k. An independent fork of the same lineage (apepojken/llama.cpp, lighter Q3 quant) reaches 50 t/s shallow but trails this branch at every prefill depth and at temp-1 decode; the two forks found the same bugs independently, which we treated as mutual validation.</p>
+  </div>
+</section>
+
+<section>
+  <h2>Full-context benchmarks: 2k → 252k</h2>
+  <p class="sec-sub">The complete degradation curves for the 262k configuration, measured as one fresh full prefill per rung plus 128 decoded tokens at production sampling (temp 0.6, stochastic speculative MTP). Two batch tiers: <b>UB=2048</b> is fastest but its boot-time fit dies to the host OOM-killer at ~192k of <em>actual fill</em>; <b>UB=1024</b> gives ~4 GB back and walks the entire context. The launcher picks automatically (see below).</p>
+
+  <div class="card">
+    <h3>Prefill — cumulative average</h3>
+    <div class="legend">
+      <span><i class="swatch" style="background:var(--prefill)"></i>UB=2048</span>
+      <span><i class="swatch" style="background:var(--accent)"></i>UB=1024</span>
+      <span><i class="swatch" style="background:var(--bad)"></i>ub2048 OOM ceiling</span>
+    </div>
+    <svg id="avgchart" class="chart" viewBox="0 0 900 430" role="img" aria-label="Cumulative prefill throughput vs depth"></svg>
+  </div>
+
+  <div class="card">
+    <h3>Prefill — marginal window rate</h3>
+    <p>The rate over just the window between adjacent rungs — the speed you actually get <em>at</em> that depth. Both tiers floor near ~185 t/s through 128–192k: the sparse-attention selection caps how much of the KV each token attends, so the per-token cost stops growing instead of decaying toward zero.</p>
+    <div class="legend">
+      <span><i class="swatch" style="background:var(--prefill)"></i>UB=2048</span>
+      <span><i class="swatch" style="background:var(--accent)"></i>UB=1024</span>
+    </div>
+    <svg id="margchart" class="chart" viewBox="0 0 900 430" role="img" aria-label="Marginal prefill rate vs depth"></svg>
+  </div>
+
+  <div class="card">
+    <h3>Decode</h3>
+    <p>The two tiers are identical within noise — decode never sees the batch size. The 8k–98k plateau is draft acceptance holding; the wobble (±15%) tracks content draftability.</p>
+    <div class="legend">
+      <span><i class="swatch" style="background:var(--prefill)"></i>UB=2048</span>
+      <span><i class="swatch" style="background:var(--accent)"></i>UB=1024</span>
+      <span><i class="swatch" style="background:var(--bad)"></i>ub2048 ceiling</span>
+    </div>
+    <svg id="tgchart" class="chart" viewBox="0 0 900 430" role="img" aria-label="Decode throughput vs depth"></svg>
+  </div>
+
+  <div class="card tablewrap">
+    <table>
+      <thead><tr>
+        <th>depth</th><th>pp ub2048</th><th>pp ub1024</th><th>Δ pp</th>
+        <th>tg ub2048</th><th>tg ub1024</th><th>prefill wall (ub1024)</th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <p class="fn">The batch-size tax shrinks with depth (−8% shallow → −4% at 192k) because attention dominates and is batch-independent. The 224k/252k rungs were measured in two independent boots on different days and replicated within ±0.5%.</p>
+  </div>
+</section>
+
+<section>
+  <h2>What shipped</h2>
+  <p class="sec-sub">Grouped by area. Every item is default-on, has a revert knob, and was validated for output quality — byte-identical where the change permits it, otherwise needle retrieval at 32k/64k plus a fixed code-task harness.</p>
+
+  <div class="card">
+    <h3>Full-context (262k) enablement<span class="tag pf">prefill</span><span class="tag dc">decode</span></h3>
+    <p>The interesting discovery: at this scale the wall is <b>host RAM, not GPU memory</b> — on a UMA APU the GTT <em>is</em> host RAM, so the "free VRAM" the tools report past ~120 GB doesn't physically exist. And the wall <b>moves during use</b>: KV pages acquire physical backing as context fills, so a configuration that boots cleanly can still be OOM-killed twenty minutes into a deep prefill. Boot-fit ≠ fill-fit.</p>
+    <ul>
+      <li><b>Target KV at q8_0.</b> Quantizing the 12 attention layers' KV (6144→3264 MiB) plus the indexer cache (2304→1224 MiB) frees <span class="num">~3.9 GB</span> of host RAM for a measured &lt;1% throughput difference, shallow and deep — 36 of 48 layers are recurrent and never touch it. <span class="knob">KV=q8_0</span></li>
+      <li><b>The fill ceiling, measured.</b> With the speculative draft loaded, UB=2048 survives to ~192k of processed context and then the kernel OOM-killer fires mid-prefill. UB=1024 returns ~4 GB of compute buffers and completes the full 252k fill with 3.1 GB to spare — <span class="num">209 t/s</span> average prefill (20.6 min), <span class="num">28.9 t/s</span> decode at full depth.</li>
+      <li><b>Automatic tiering.</b> The launcher's deep-context guard applies all of it: above 96k it swaps to the Q4 draft (the Q8 draft OOMs host RAM past ~120k), above 128k it sets KV=q8_0, above 192k it steps to UB=1024 so a full-depth fill survives. Every step prints what it did and every step can be overridden. <span class="knob">DEEPMTP=0</span></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Speculative decoding (MTP)<span class="tag dc">decode</span></h3>
+    <ul>
+      <li><b>MTP draft head.</b> Ported the model's next-token-prediction block as a llama.cpp draft model. <span class="num">+72%</span> decode at temp 0 shallow, growing to <span class="num">+155%</span> at 128k, because base decode collapses with depth and drafted decode doesn't.</li>
+      <li><b>Stochastic speculative sampling.</b> Exact-match verification makes speculation a wash at temp&nbsp;&gt;&nbsp;0, so the draft now samples with the target's sampling parameters and the server verifies by rejection sampling — lossless for the target distribution. Temp-1 chat: <span class="num">37.9 t/s</span> vs ~26 without (<span class="num">+46%</span>). <span class="knob">SPEC_STOCH=0</span></li>
+      <li><b>Draft micro-batch decoupling.</b> The draft used to inherit the target's ubatch 2048 and duplicate its scaled buffers, which walled prefill at ~82k. <span class="knob">--spec-draft-ubatch 512</span> removes the wall and gains <span class="num">+11–13%</span> prefill with MTP on.</li>
+      <li><b>Partial recurrent rollback.</b> Rejected draft tokens used to restore a 112 MiB checkpoint; now the recurrent state rolls back in place. <span class="num">+19%</span> decode at temp 1. The first version corrupted the conv state by snapshotting only plane 0 — fixed, and acceptance matches the checkpoint path exactly. <span class="knob">RSROLL=0</span></li>
+      <li><b>Draft depth by temperature.</b> Draft length 6 wins at temp 0, 4 wins under sampling (deep sampled drafts diverge and rejections discard more). The launcher switches on <span class="knob">TEMP</span>.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Sparse attention (QSA)<span class="tag pf">prefill</span><span class="tag dc">decode</span></h3>
+    <ul>
+      <li><b>Block-level indexer top-k.</b> Selecting whole indexer blocks instead of expanding scores to per-cell resolution deletes a ~2 GB score buffer and, incidentally, a real bug: the per-cell sort exceeded Vulkan's k&nbsp;&lt;&nbsp;1024 top-k limit, so every step past ~1k context silently sorted on the CPU — about 14k dispatches per run, now zero. <span class="num">pp +25%, tg +11%</span> at 32–64k. <span class="knob">BLKTOPK=0</span></li>
+      <li><b>Gathered sparse prefill.</b> At depth, the QSA layers streamed the whole KV cache through flash attention only to mask most of it. Tokens near each other select mostly the same cells (a 128-token window's union covers 30–50% of the cache), so three small custom ops deduplicate each window's selections, gather those K/V rows and mask columns, and run standard flash attention on the gathered subset. Mathematically equal to the masked-dense path. <span class="num">+6%</span> marginal prefill at 32–49k, <span class="num">+10%</span> at 49–63k. <span class="knob">GP=0</span></li>
+      <li><b>Pooled-key summary cache.</b> One f32 summary row per position block feeds the indexer instead of recomputing pooled keys per step; writes are deferred so prefill never pays for them. <span class="num">tg +6–9%</span> at 32–41k, byte-identical. <span class="knob">POOLED=0</span></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Expert GEMMs (MoE)<span class="tag pf">prefill</span></h3>
+    <p>The 512-expert matmuls are ~34% of prefill and the hardest problem on this GPU. What the measurements established: they are <b>not</b> bandwidth-bound (tiles stream 67–110 GB/s of the available 256) and <b>not</b> dequant-bound (trivial-dequant q5_1 ties heavy-dequant q4_K at ~9.5 TFLOPS). The limiter is latency structure — the indirect row-ID gather plus ~40 rows per expert, too little work per tile to hide memory latency. Wins here are correspondingly modest and additive:</p>
+    <ul>
+      <li><b>Row-list prepass + compact dispatch.</b> A GPU prepass builds per-expert row lists once, so tile workgroups read their rows directly instead of re-scanning the ID tensor, and only live (expert, tile) pairs launch — the old grid was ~97% dead workgroups. <span class="num">+1%</span> (dead launches turn out to be nearly free on RDNA3.5). Upstream later built the same prepass independently (#26686); both paths now coexist. <span class="knob">GGML_VK_MMID_COMPACT=0</span></li>
+      <li><b>48-wide tile.</b> BN=64 padded ~38% of lanes at 40 rows/expert; a 3-fragment 48-wide warp grid pads 17%. <span class="num">+1.4%</span>, byte-identical. <span class="knob">GGML_VK_MMID_BN48=0</span></li>
+      <li><b>Per-expert tile selection.</b> Pick the tile by expected rows per expert, not batch width, so decode and speculative-verify batches use the small tile that suits them. Also covers routing-weight fusion into the tile store (<span class="num">+2.9%</span> prefill) and f16 activation staging.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Kernel fusion<span class="tag pf">prefill</span><span class="tag dc">decode</span></h3>
+    <ul>
+      <li><b>Matmul epilogue fusion.</b> The scale → sigmoid/silu → scale → multiply chains that follow the wide dense GEMMs (hyper-connection gates, attention out-gate) now run in f32 on the accumulators inside the matmul store instead of as separate passes. <span class="num">+3.3%</span> prefill total; the fused multiply is bit-exact. <span class="knob">GGML_VK_MM_TILE_EPILOG=0</span></li>
+      <li><b>Fused hyper-connection ops.</b> The combine step (residual + gated block output) is one custom op instead of a repeat/mul/add chain, and the mix tail (sigmoid, gate, mean-collapse over 4 streams) is another — that one replaces ~7 dispatches per call, 96 calls per decoded token. <span class="num">+0.5–0.9%</span> decode. <span class="knob">Q4X_HC_MIX_NOFUSE=1</span></li>
+      <li><b>Transposed inject projection.</b> The hyper-connection inject matmul has M=4 — pathological for a tiled kernel, and it cost ~16% of prefill. Computing it transposed dispatches the efficient GEMV path instead; the op now costs 1.7%.</li>
+      <li><b>Contiguous conv concat + batch 2048.</b> A one-line <span class="knob">ggml_cont</span> on the delta-net conv input (<span class="num">+3%</span> shallow), and raising the micro-batch to 2048 (<span class="num">+25%</span> prefill), the single best config flip.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Correctness fixes<span class="tag fx">bugs</span></h3>
+    <ul>
+      <li><b>Vulkan queue deadlock.</b> Any device-side wait on the shared queue could be enqueued ahead of its signal and wedge the GPU under MTP's small batch shapes. Cross-context waits now happen on the host via <span class="knob">vkWaitSemaphores</span>, so the queue always drains.</li>
+      <li><b>Speculative replay livelock.</b> With non-bit-reproducible redecode, a rejected draft could re-reject forever at deterministic slot-reuse boundaries. The server forces one plain decode step after three same-position restores, which makes livelock impossible regardless of numerics.</li>
+      <li><b>Shared-memory scrambling at BK&nbsp;&gt;&nbsp;32.</b> The q4_0/q4_1/q5_0/q5_1 matmul loaders hard-coded the split-nibble +8 offset for a 32-wide K block; any deeper K block makes two thread groups race on the same shared slots. Found while testing BK=64 (which is a loss anyway); the block-relative fix is bit-identical at BK=32 and defuses the trap for future tile work. Likely relevant upstream.</li>
+      <li><b>Context-shift crash with unquantized K cache</b> (upstream fix, merged): the Hadamard rotation matrix was copied to a tensor that may have no buffer.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Upstream sync</h3>
+    <p>The branch tracks ggml-org master by merge; the latest sync brings in 54 commits including upstream's own Flash-Next work (radix top-k for k ≥ 1024, mat-vec tuning for Strix Halo, fewer graph splits in qwen4exp) alongside this fork's machinery. Where the two overlap — upstream's row-ID hoisting is nearly the same prepass as ours — both paths coexist and the fork's validated defaults stay in charge.</p>
+    <p>Validated on-box against the pre-merge build with the identical bench script: recall, stability, and draft acceptance are unchanged (needles 3/3, harness 10/10, acceptance 0.871 vs 0.873); prefill is equal or better through 32k; shallow decode gains <span class="num">+6.7%</span> (upstream's RDNA3 mat-vec dispatch wins on this APU too — <span class="knob">GGML_VK_RDNA3_MMV_TUNE=0</span> reverts). One residual: decode at 32k reads −6.6%, of which ~2 points trace to a slower single-token flash-attention dispatch (222&nbsp;→&nbsp;257&nbsp;µs at 33k KV, same shape). The working branch runs the fully-validated pre-merge state; the merged tree is preserved on <span class="knob">flashnext-v2-merged</span> with the depth-decode residual as the open item before re-adoption.</p>
+  </div>
+</section>
+
+<section>
+  <h2>What didn't work</h2>
+  <p class="sec-sub">All measured, all reverted. Kept here so nobody retries them blind.</p>
+  <div class="card tablewrap">
+    <table class="dead">
+      <tr><th style="text-align:left">Attempt</th><th style="text-align:left">Result</th><th style="text-align:left">Why</th></tr>
+      <tr><td>Scalar sparse QSA attention</td><td class="r">no win</td><td>Attention is &lt;1% of decode; scalar prefill lost to the uncoalesced gather. The gathered redesign above is what worked.</td></tr>
+      <tr><td>Gathered attention at decode</td><td class="r">−1–18%</td><td>Masked-dense with a cheap mask beats gather-and-copy at every depth for single tokens.</td></tr>
+      <tr><td>Int-dot (Q8_1) expert path</td><td class="r">−10%</td><td>The scalar DP4A shader forfeits f16 WMMA; byte savings don't compensate on RDNA3.5.</td></tr>
+      <tr><td>Bigger/reshaped tiles (BM256, thin-BM, W=512)</td><td class="r">−1 to −9%</td><td>Register pressure and B-restreaming beat every reshape; the shipped geometry is a local optimum.</td></tr>
+      <tr><td>Deeper K block (BK 32→64)</td><td class="r">−3 to −6%</td><td>Looked like +9% until needle tests failed; the "win" was the shared-memory race above dropping writes. Correct version loses on LDS occupancy.</td></tr>
+      <tr><td>Mat-vec rows-per-workgroup sweep</td><td class="r">flat</td><td>The decode GEMV already runs at ~89% of DRAM bandwidth. Launch shape can't add bytes.</td></tr>
+      <tr><td>KV-cache quantization for speed</td><td class="r">wash</td><td>36 of 48 layers are recurrent and hold no KV, so q8_0 buys no throughput — but the same wash later became the deep-context <em>fit</em> lever: −3.9 GB of host RAM is what lets 262k boot with the fast batch tier.</td></tr>
+      <tr><td>Micro-batch 3072, f16-B dense sweep, driver flags</td><td class="r">flat / −2%</td><td>Swept with engagement evidence; nothing reproduced.</td></tr>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>Method notes</h2>
+  <div class="card">
+    <ul>
+      <li><b>Marginal windows, not point probes.</b> A single 2048-token probe at depth understates both legs and can swallow a real 10% difference — the gathered-prefill win only appeared in ≥6k-token windows. The chain's own per-task rates are free; read them.</li>
+      <li><b>Engagement evidence before belief.</b> Every knob prints a one-shot line or is probed; several early "results" were legs where the environment never reached the binary (containers don't forward env, and one launcher was a stale copy for half a day).</li>
+      <li><b>Unexpected output differences are bug reports.</b> Changes that should be bit-identical get compared byte-for-byte; when BK=64 "won" but outputs drifted, the drift was the bug. Quality gates are cloze needles at 32k/64k plus a 10-task code harness, run before any default flips.</li>
+      <li><b>Boot-fit ≠ fill-fit.</b> On unified memory, KV pages acquire physical backing as context fills; a server that boots with gigabytes "free" can be OOM-killed twenty minutes into a deep prefill. Fill validation — an actual full-depth prefill — is part of every deep-context default now.</li>
+      <li><b>Deep-context failures that look like model damage are often state accumulation.</b> A per-token FFN error too small to affect short outputs compounds through the recurrent layers over 32k tokens into retrieval collapse with perfectly coherent shallow behavior.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <h2>Running it</h2>
+  <div class="card">
+    <p>Everything is driven by <span class="knob">scripts/run/run-flashnext.sh</span>, which starts llama-server with the validated defaults (ubatch 2048, coopmat on, block top-k, gathered prefill, pooled cache, fusion) and forwards the revert knobs listed above. Recommended sampling: <b>code</b> = temp 0, penalties off, thinking off (<span class="knob">MTP=1 TEMP=0 REASONING=none</span>); <b>chat</b> = temp 1 with stochastic speculation (auto-on).</p>
+    <pre><span class="c"># chat / creative (temp 1, stochastic speculation auto-on with MTP=1)</span>
+MTP=1 ./run-flashnext.sh
+
+<span class="c"># fastest deterministic code generation</span>
+MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
+
+<span class="c"># full 262k context — the deep-context guard handles the rest automatically:</span>
+<span class="c">#   &gt;96k: Q4 draft · &gt;128k: KV=q8_0 · &gt;192k: UB=1024 (so a full fill survives)</span>
+MTP=1 CTX=262144 ./run-flashnext.sh
+
+<span class="c"># pin the fast batch tier if your jobs stay under ~190k of fill</span>
+MTP=1 CTX=262144 UB=2048 ./run-flashnext.sh</pre>
+    <p>Branch: <a href="https://github.com/wdenejko/llama.cpp/tree/flashnext-v2">wdenejko/llama.cpp · flashnext-v2</a>. A Fedora toolbox container build (Vulkan/RADV, gfx1151) is in CI on the same branch.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap" style="padding:0">
+    Measured on: Ryzen AI MAX+ 395 (Strix Halo), Radeon 8060S (gfx1151, 40 CU), 128 GB LPDDR5X, Fedora 42, Mesa 25.3.6 RADV · model Qwen3.8-Flash-Next UD-Q4_K_XL.<br>
+    Related upstream work: #27742 (qwen4exp), #28032 (radix top-k), #27909 (Strix mat-vec tuning), #26686 (row-ID hoisting), #27925 (mul_mat_id K padding), #27880 (graph splits).
+  </div>
+</footer>
+
+</main>
+
+<script>
+const A = { // UB=2048 (dies past 192k fill)
+  d:    [2048, 8192, 16384, 32768, 65536, 98304, 131072, 163840, 196608],
+  pp:   [621.9, 578.3, 540.9, 478.6, 403.7, 334.9, 282.5, 258.6, 242.6],
+  marg: [621.9, 565.1, 508.0, 429.2, 349.1, 249.8, 192.3, 193.1, 185.5],
+  tg:   [35.0, 48.2, 35.3, 41.9, 42.3, 40.1, 34.3, 25.2, 22.7],
+};
+const B = { // UB=1024 (full ladder)
+  d:    [2048, 8192, 16384, 32768, 65536, 98304, 131072, 163840, 196608, 229376, 258048],
+  pp:   [571.9, 533.8, 503.0, 446.5, 375.0, 313.5, 268.2, 246.6, 233.1, 220.3, 208.7],
+  marg: [571.9, 522.2, 475.5, 401.4, 323.3, 236.1, 187.0, 186.6, 183.0, 165.8, 146.7],
+  tg:   [40.0, 53.7, 34.5, 40.6, 41.2, 40.3, 34.3, 26.2, 21.9, 20.1, 28.9],
+  wall: ["3.6 s", "15 s", "33 s", "73 s", "2.9 min", "5.2 min", "8.1 min", "11.1 min", "14.1 min", "17.4 min", "20.6 min"],
+};
+const OOM = 229376;
+
+const fmtK = d => (d >= 1024 ? Math.round(d / 1024) + "k" : d);
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+function chart(el, series, yMax, yStep, yLabel, oomLabel) {
+  const W = 900, H = 430, L = 62, R = 24, T = 16, B_ = 46;
+  const x0 = Math.log2(2048), x1 = Math.log2(258048);
+  const X = d => L + (Math.log2(d) - x0) / (x1 - x0) * (W - L - R);
+  const Y = v => T + (1 - v / yMax) * (H - T - B_);
+  const ink = css("--ink"), muted = css("--ink-faint"), grid = css("--border"), danger = css("--bad");
+  let s = "";
+  for (let v = 0; v <= yMax; v += yStep) {
+    s += `<line x1="${L}" y1="${Y(v)}" x2="${W - R}" y2="${Y(v)}" stroke="${grid}" stroke-width="1"/>`;
+    s += `<text x="${L - 8}" y="${Y(v) + 4}" text-anchor="end" font-size="12" fill="${muted}" font-family="IBM Plex Mono,ui-monospace,monospace">${v}</text>`;
+  }
+  for (const d of B.d) {
+    s += `<line x1="${X(d)}" y1="${H - B_}" x2="${X(d)}" y2="${H - B_ + 5}" stroke="${muted}" stroke-width="1"/>`;
+    s += `<text x="${X(d)}" y="${H - B_ + 20}" text-anchor="middle" font-size="11.5" fill="${muted}" font-family="IBM Plex Mono,ui-monospace,monospace">${fmtK(d)}</text>`;
+  }
+  s += `<text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle" font-size="12" fill="${muted}">context depth (tokens, log scale)</text>`;
+  s += `<text x="16" y="${(T + H - B_) / 2}" text-anchor="middle" font-size="12" fill="${muted}" transform="rotate(-90 16 ${(T + H - B_) / 2})">${yLabel}</text>`;
+  if (oomLabel) {
+    s += `<line x1="${X(OOM)}" y1="${T}" x2="${X(OOM)}" y2="${H - B_}" stroke="${danger}" stroke-width="1.5" stroke-dasharray="5 4"/>`;
+    s += `<text x="${X(OOM) - 7}" y="${T + 13}" text-anchor="end" font-size="11.5" fill="${danger}" font-family="IBM Plex Mono,ui-monospace,monospace">${oomLabel}</text>`;
+  }
+  for (const ser of series) {
+    const pts = ser.d.map((d, i) => [X(d), Y(ser.v[i])]);
+    const path = pts.map(p => p.join(",")).join(" ");
+    if (ser.fill) s += `<polygon points="${L},${Y(0)} ${path} ${pts[pts.length - 1][0]},${Y(0)}" fill="${ser.fill}"/>`;
+    s += `<polyline points="${path}" fill="none" stroke="${ser.c}" stroke-width="2.5" stroke-linejoin="round"/>`;
+    pts.forEach((p, i) => {
+      s += `<circle cx="${p[0]}" cy="${p[1]}" r="3.2" fill="${ser.c}"/>`;
+      if (ser.labels && (i % 2 === ser.labelPhase || i >= pts.length - 2)) {
+        s += `<text x="${p[0]}" y="${p[1] + (ser.labelBelow ? 17 : -9)}" text-anchor="middle" font-size="10.5" fill="${ink}" font-family="IBM Plex Mono,ui-monospace,monospace">${ser.v[i]}</text>`;
+      }
+    });
+  }
+  el.innerHTML = s;
+}
+
+function render() {
+  const a = css("--prefill"), b = css("--accent");
+  chart(document.getElementById("avgchart"), [
+    { d: B.d, v: B.pp, c: b, fill: css("--accent-soft"), labels: true, labelPhase: 1, labelBelow: true },
+    { d: A.d, v: A.pp, c: a, labels: true, labelPhase: 0 },
+  ], 650, 100, "prefill t/s (cumulative avg)", "ub2048: host OOM @192k fill");
+  chart(document.getElementById("margchart"), [
+    { d: B.d, v: B.marg, c: b, labels: true, labelPhase: 1, labelBelow: true },
+    { d: A.d, v: A.marg, c: a, labels: true, labelPhase: 0 },
+  ], 650, 100, "prefill t/s (marginal)", null);
+  chart(document.getElementById("tgchart"), [
+    { d: B.d, v: B.tg, c: b, labels: true, labelPhase: 1, labelBelow: true },
+    { d: A.d, v: A.tg, c: a, labels: true, labelPhase: 0 },
+  ], 60, 10, "decode t/s", "ub2048 ceiling");
+
+  const tb = document.getElementById("tbody");
+  let rows = "";
+  B.d.forEach((d, i) => {
+    const ai = A.d.indexOf(d);
+    const app = ai >= 0 ? A.pp[ai].toFixed(1) : `<span style="color:var(--bad);font-weight:600">OOM</span>`;
+    const atg = ai >= 0 ? A.tg[ai].toFixed(1) : `—`;
+    const dpp = ai >= 0 ? (100 * (B.pp[i] - A.pp[ai]) / A.pp[ai]).toFixed(1) + "%" : "—";
+    rows += `<tr><td>${fmtK(d)}</td><td>${app}</td><td>${B.pp[i].toFixed(1)}</td><td>${dpp}</td><td>${atg}</td><td>${B.tg[i].toFixed(1)}</td><td>${B.wall[i]}</td></tr>`;
+  });
+  tb.innerHTML = rows;
+}
+render();
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+</script>
+</body>
+</html>
