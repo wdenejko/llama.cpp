@@ -213,6 +213,39 @@
 </section>
 
 <section>
+  <h2>The Uncensored IQ4_XS variant</h2>
+  <p class="sec-sub">A community finetune of the same model (orcarouter's Qwen3.8-Flash-Next-Uncensored, IQ4_XS, 97.5&nbsp;GB — the repo is gated, so downloads need a Hugging Face token). Same arch, ~13&nbsp;GB less on the GPU (65.2 vs 78.1&nbsp;GB of weights), which transforms the memory story: 18–20&nbsp;GB of host headroom all the way down, zero swap. Measured at UB=2048 with the same one-boot ladder.</p>
+
+  <div class="card">
+    <h3>Prefill vs the base model (both UB=2048)</h3>
+    <div class="legend">
+      <span><i class="swatch" style="background:var(--decode)"></i>Uncensored IQ4_XS</span>
+      <span><i class="swatch" style="background:var(--prefill)"></i>base UD-Q4_K_XL</span>
+      <span><i class="swatch" style="background:var(--bad)"></i>ceilings (see below)</span>
+    </div>
+    <svg id="iqppchart" class="chart" viewBox="0 0 900 430" role="img" aria-label="IQ4_XS prefill vs base model"></svg>
+  </div>
+
+  <div class="card tablewrap">
+    <table>
+      <thead><tr><th>depth</th><th>pp IQ4_XS</th><th>pp base</th><th>Δ</th><th>tg IQ4_XS</th><th>tg base</th></tr></thead>
+      <tbody id="iqtbody"></tbody>
+    </table>
+    <p class="fn">Shallow prefill −5%, parity through 96k, then a growing i-quant depth tax (−21% at 160k, −29% at 192k — not yet profiled). Decode at parity throughout, with a stronger 38–51&nbsp;t/s plateau to 96k. Host avail never dropped below 18&nbsp;GB (the base model runs this config at 0.4–6&nbsp;GB).</p>
+  </div>
+
+  <div class="card">
+    <h3>Two ceilings, precisely mapped</h3>
+    <ul>
+      <li><b>The base model's ub2048 ceiling is memory:</b> host OOM at ~192k of fill (see above).</li>
+      <li><b>IQ4_XS's ub2048 ceiling is a GPU watchdog, not memory:</b> with RAM to spare, prefill deterministically dies at ~227k — an <span class="knob">amdgpu ring timeout</span>, reproduced twice on different ring instances. A single compute dispatch (prime suspect: gathered sparse attention at [union&nbsp;×&nbsp;batch] scale) crosses the ~10&nbsp;s watchdog; the base model at UB=1024 runs 0.57× that dispatch size and always passed. The fix is splitting that dispatch — kernel work, tracked. Until then the launcher's automatic UB=1024 step above 192k applies to this quant too.</li>
+      <li><b>Spending the headroom doesn't buy prefill:</b> A/B-tested moving the 27.5&nbsp;GB per-layer-embedding table back to the GPU (a wash — and the placement flag proved inert: the tensor stays in an anonymous host buffer either way) and UB=3072 (flat to slightly negative). The headroom's real value is fill safety and zero swap. Also settled an old mystery: the "cold PLE" prefill tax on the base model was <em>anonymous-page swap under RAM pressure</em>, not page-cache misses — on this quant it simply doesn't exist.</li>
+      <li><b>Template quirk:</b> the finetune's chat template enforces reasoning efforts <span class="knob">xhigh|medium|low</span> (xhigh is its default) and rejects <span class="knob">high</span>; the launcher remaps automatically.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
   <h2>What shipped</h2>
   <p class="sec-sub">Grouped by area. Every item is default-on, has a revert knob, and was validated for output quality — byte-identical where the change permits it, otherwise needle retrieval at 32k/64k plus a fixed code-task harness.</p>
 
@@ -358,6 +391,11 @@ const B = { // UB=1024 (full ladder)
   wall: ["3.6 s", "15 s", "33 s", "73 s", "2.9 min", "5.2 min", "8.1 min", "11.1 min", "14.1 min", "17.4 min", "20.6 min"],
 };
 const OOM = 229376;
+const C = { // Uncensored IQ4_XS @ UB=2048 (ring-timeout ceiling ~227k)
+  d:  [2048, 8192, 16384, 32768, 65536, 98304, 131072, 163840, 196608],
+  pp: [589.1, 555.3, 529.1, 471.1, 383.5, 310.4, 250.3, 204.9, 171.3],
+  tg: [38.5, 51.2, 40.4, 39.5, 39.2, 38.5, 24.2, 26.0, 22.9],
+};
 
 const fmtK = d => (d >= 1024 ? Math.round(d / 1024) + "k" : d);
 const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
@@ -412,6 +450,21 @@ function render() {
     { d: B.d, v: B.tg, c: b, labels: true, labelPhase: 1, labelBelow: true },
     { d: A.d, v: A.tg, c: a, labels: true, labelPhase: 0 },
   ], 60, 10, "decode t/s", "ub2048 ceiling");
+
+  chart(document.getElementById("iqppchart"), [
+    { d: A.d, v: A.pp, c: css("--prefill") },
+    { d: C.d, v: C.pp, c: css("--decode"), fill: css("--decode-soft"), labels: true, labelPhase: 0 },
+  ], 650, 100, "prefill t/s (cumulative avg)", "watchdog / OOM ceilings ~192-227k");
+
+  const iqtb = document.getElementById("iqtbody");
+  let iqrows = "";
+  C.d.forEach((d, i) => {
+    const ai = A.d.indexOf(d);
+    const dpp = ai >= 0 ? (100 * (C.pp[i] - A.pp[ai]) / A.pp[ai]).toFixed(1) + "%" : "—";
+    iqrows += `<tr><td>${fmtK(d)}</td><td>${C.pp[i].toFixed(1)}</td><td>${ai >= 0 ? A.pp[ai].toFixed(1) : "—"}</td><td>${dpp}</td><td>${C.tg[i].toFixed(1)}</td><td>${ai >= 0 ? A.tg[ai].toFixed(1) : "—"}</td></tr>`;
+  });
+  iqrows += `<tr><td>224k</td><td colspan="5" style="text-align:left;color:var(--bad);font-weight:600">✗ deterministic amdgpu ring timeout at ~227k (2× reproduced) — GPU watchdog, not memory</td></tr>`;
+  iqtb.innerHTML = iqrows;
 
   const tb = document.getElementById("tbody");
   let rows = "";
