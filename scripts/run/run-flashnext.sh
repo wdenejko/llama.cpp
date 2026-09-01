@@ -14,11 +14,11 @@
 #   Fast deterministic code:     MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
 #   Fast reasoning/creative:     MTP=1 ./run-flashnext.sh   (temp 1, stoch spec sampling auto-on)
 export PATH="$PATH:/usr/sbin:/sbin"
-# The serving container `wdenejko` is created from the published GHCR image
+# The serving container `llama-vulkan-wdenejko` is created from the published GHCR image
 # (ghcr.io/wdenejko/llama.cpp/strix-halo-toolbox:vulkan-radv, exact-env pinned); builds
-# happen in `wdenejko-build` (same pinned toolchain). Serve the image's own binaries with:
+# happen in `llama-vulkan-wdenejko-build` (same pinned toolchain). Serve the image's own binaries with:
 #   BIN=/usr/local/bin ./run-flashnext.sh
-TOOLBOX="${TOOLBOX:-wdenejko}"
+TOOLBOX="${TOOLBOX:-llama-vulkan-wdenejko}"
 BIN="${BIN:-/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin}"   # rebased build WITH MTP (old build/ has NO MTP)
 SRV_PAT="${BIN}/[l]lama-server"   # kill/refuse patterns track BIN so image-binary servers are covered too
 MODELS=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF
