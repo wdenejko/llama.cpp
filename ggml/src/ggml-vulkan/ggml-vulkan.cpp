@@ -19780,11 +19780,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     fprintf(stderr, "ggml_vulkan: [job-governor] prev graph: %u jobs, max %.1f ms (clamp %.2f throttle %d)\n",
                             ctx->job_query_idx - 1, max_ms, ctx->job_clamp, ctx->job_throttle_active ? 1 : 0);
                 }
-                // in-flight throttle hysteresis: prefill depth grows jobs smoothly, so this
-                // engages long before residency (~2-3 jobs deep) can cross the ~10s watchdog
-                if (max_ms > 500.0 && !ctx->job_throttle_active) {
+                // in-flight throttle (OPT-IN, default off): DISPROVEN as a fix for the
+                // ~227k ub2048 ring timeout — bounding concurrent submissions did not
+                // prevent the crash (it still fired, earlier if anything), because the
+                // failure is a single job that never signals (kernel hang), not too many
+                // jobs resident. Kept behind GGML_VK_JOB_THROTTLE for future experiments.
+                static const bool throttle_opt_in = getenv("GGML_VK_JOB_THROTTLE") != nullptr;
+                if (throttle_opt_in && max_ms > 500.0 && !ctx->job_throttle_active) {
                     ctx->job_throttle_active = true;
-                    fprintf(stderr, "ggml_vulkan: [job-governor] jobs at %.0f ms: bounding in-flight submissions to 2 (watchdog residency guard)\n", max_ms);
+                    fprintf(stderr, "ggml_vulkan: [job-governor] jobs at %.0f ms: bounding in-flight submissions to 2\n", max_ms);
                 } else if (max_ms < 250.0 && ctx->job_throttle_active) {
                     ctx->job_throttle_active = false;
                 }
