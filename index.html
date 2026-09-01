@@ -363,7 +363,9 @@ MTP=1 CTX=262144 ./run-flashnext.sh
 
 <span class="c"># pin the fast batch tier if your jobs stay under ~190k of fill</span>
 MTP=1 CTX=262144 UB=2048 ./run-flashnext.sh</pre>
-    <p>Branch: <a href="https://github.com/wdenejko/llama.cpp/tree/flashnext-v2">wdenejko/llama.cpp · flashnext-v2</a>. A Fedora toolbox container build (Vulkan/RADV, gfx1151) is in CI on the same branch.</p>
+    <p>Source: <a href="https://github.com/wdenejko/llama.cpp">wdenejko/llama.cpp · master</a>. Or skip the build — the prebuilt toolbox image is the exact environment these numbers were measured in (Fedora 43, Vulkan/RADV, znver5):</p>
+    <pre><span class="c"># one command, then run the launcher from inside or via toolbox run</span>
+toolbox create llama-vulkan-wdenejko --image ghcr.io/wdenejko/llama.cpp/llama-vulkan-wdenejko:latest</pre>
   </div>
 </section>
 
