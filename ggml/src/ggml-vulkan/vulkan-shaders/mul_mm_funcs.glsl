@@ -80,7 +80,12 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const vec4 v0 = (vec4(unpack8(vui & 0x0F0F0F0F)) - 8.0f) * d;
             const vec4 v1 = (vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) - 8.0f) * d;
 
-            const uint k_pair = row * LOAD_VEC_A / 4;
+            // block-relative pair index: the 32-wide quant block splits low/high
+            // nibbles 16 elements apart, so the +8 half-offset must be relative to
+            // the covering quant block, not the BK pass (scrambles for BK > 32;
+            // identical to the plain index for BK == 32)
+            const uint u = row * LOAD_VEC_A / 4;
+            const uint k_pair = (u / 8) * 16 + (u % 8);
             store_a(col, k_pair,     FLOAT_TYPEV2(v0.xy));
             store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
             store_a(col, k_pair + 8, FLOAT_TYPEV2(v1.xy));
@@ -96,7 +101,12 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const vec4 v0 = vec4(unpack8(vui & 0x0F0F0F0F)) * dm.x + dm.y;
             const vec4 v1 = vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) * dm.x + dm.y;
 
-            const uint k_pair = row * LOAD_VEC_A / 4;
+            // block-relative pair index: the 32-wide quant block splits low/high
+            // nibbles 16 elements apart, so the +8 half-offset must be relative to
+            // the covering quant block, not the BK pass (scrambles for BK > 32;
+            // identical to the plain index for BK == 32)
+            const uint u = row * LOAD_VEC_A / 4;
+            const uint k_pair = (u / 8) * 16 + (u % 8);
             store_a(col, k_pair,     FLOAT_TYPEV2(v0.xy));
             store_a(col, k_pair + 1, FLOAT_TYPEV2(v0.zw));
             store_a(col, k_pair + 8, FLOAT_TYPEV2(v1.xy));
@@ -114,8 +124,10 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const uint vui = uint(data_a_packed16[ib].qs[iqs]);
             const vec4 v = (vec4((vui & 0xF) | qh0.x, ((vui >> 4) & 0xF) | qh0.y, ((vui >> 8) & 0xF) | qh1.x, (vui >> 12) | qh1.y) - 16.0f) * d;
-            store_a(col, row,     FLOAT_TYPEV2(v.xz));
-            store_a(col, row + 8, FLOAT_TYPEV2(v.yw));
+            // block-relative pair index (see the q4_0 note; wrong for BK > 32 otherwise)
+            const uint kb = (row / 8) * 16 + (row % 8);
+            store_a(col, kb,     FLOAT_TYPEV2(v.xz));
+            store_a(col, kb + 8, FLOAT_TYPEV2(v.yw));
 #elif defined(DATA_A_Q5_1)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
 
@@ -133,7 +145,9 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const vec4 v0 = vec4((vui & 0xF) | qh0.x, ((vui >> 4) & 0xF) | qh0.y, ((vui >> 8) & 0xF) | qh1.x, ((vui >> 12) & 0xF) | qh1.y) * dm.x + dm.y;
             const vec4 v1 = vec4(((vui >> 16) & 0xF) | qh2.x, ((vui >> 20) & 0xF) | qh2.y, ((vui >> 24) & 0xF) | qh3.x, ((vui >> 28) & 0xF) | qh3.y) * dm.x + dm.y;
 
-            const uint k_pair = row * LOAD_VEC_A / 4;
+            // block-relative pair index (see the q4_0 note; wrong for BK > 32 otherwise)
+            const uint u = row * LOAD_VEC_A / 4;
+            const uint k_pair = (u / 8) * 16 + (u % 8);
             store_a(col, k_pair,     FLOAT_TYPEV2(v0.xz));
             store_a(col, k_pair + 1, FLOAT_TYPEV2(v1.xz));
             store_a(col, k_pair + 8, FLOAT_TYPEV2(v0.yw));
@@ -244,8 +258,14 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const uint n = iqs / 32;                   // 0,1,2,3
             const uint b = (iqs % 32) / 16;            // 0,1
-            const uint is = 2 * n + b;                 // 0..7
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
+
+#ifdef MMID_QK_SCACHE
+            // (d, m) precomputed per (tile row, sub-block) at superblock boundaries
+            const float d = scache_dm[col * 8 + 2 * n + b].x;
+            const float m = scache_dm[col * 8 + 2 * n + b].y;
+#else
+            const uint is = 2 * n + b;                 // 0..7
 
             const vec2 loadd = vec2(data_a[ib].dm);
 
@@ -266,6 +286,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const float d = loadd.x * sc;
             const float m = -loadd.y * mbyte;
+#endif
 
             const vec4 q = vec4(unpack8((data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F));
 
@@ -280,9 +301,15 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const uint n = iqs / 32;                   // 0,1,2,3
             const uint b = (iqs % 32) / 16;            // 0,1
-            const uint is = 2 * n + b;                 // 0..7
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
             const uint qhi = (iqs % 16) * 2;           // 0,2,4..30
+
+#ifdef MMID_QK_SCACHE
+            // (d, m) precomputed per (tile row, sub-block) at superblock boundaries
+            const float d = scache_dm[col * 8 + 2 * n + b].x;
+            const float m = scache_dm[col * 8 + 2 * n + b].y;
+#else
+            const uint is = 2 * n + b;                 // 0..7
 
             const vec2 loadd = vec2(data_a[ib].dm);
 
@@ -303,6 +330,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             const float d = loadd.x * sc;
             const float m = -loadd.y * mbyte;
+#endif
 
             const uint qs = (data_a_packed32[ib].qs[qsi / 4] >> (b * 4)) & 0x0F0F0F0F;
             const uint qh = ((data_a_packed32[ib].qh[qhi / 4] >> (iqs / 16)) & 0x01010101) << 4;

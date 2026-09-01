@@ -1,0 +1,38 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+// qwen4exp gathered sparse prefill, step 3 (mirrors ggml_compute_forward_q4x_qsa_kv_gather):
+// out[:, c] = rows[:, list[c]] - straight f16 row gather of the union-selected KV cells,
+// skipping the get_rows->f32->cast round trip. List pads point at row 0; the -inf mask
+// entries emitted by q4x_qsa_mask_gather keep those rows out of the softmax.
+// rows F16 [row_sz, n_rows] (strided rows), list I32 [c_max+1], dst F16 [row_sz, c_max].
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer RBuf { uint16_t data_r[]; };
+layout(binding = 1) readonly  buffer LBuf { int data_l[]; };
+layout(binding = 2) writeonly buffer DBuf { uint16_t data_d[]; };
+
+layout(push_constant) uniform Parameters {
+    uint row_sz;
+    uint c_max;
+    uint n_rows;
+    uint ss1;    // rows stride in f16 elements
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.row_sz * p.c_max) {
+        return;
+    }
+
+    const uint c = i / p.row_sz;
+    const uint j = i % p.row_sz;
+
+    const int  cell = data_l[c];
+    const uint r    = (cell >= 0 && uint(cell) < p.n_rows) ? uint(cell) : 0u;
+
+    data_d[c * p.row_sz + j] = data_r[r * p.ss1 + j];
+}

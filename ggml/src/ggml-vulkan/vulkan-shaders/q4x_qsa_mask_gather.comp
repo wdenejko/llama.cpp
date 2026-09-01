@@ -1,0 +1,47 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+// qwen4exp gathered sparse prefill, step 2 (mirrors ggml_compute_forward_q4x_qsa_mask_gather):
+// out[c, t] = c < count ? mask[list[c], t] : -inf, where list/count come from
+// q4x_qsa_union. Pure f16 bit copy; -inf pads make the position-0 K/V pads of
+// the gathered cache harmless. mask F16 [n_kv, nt] (strided rows), list I32
+// [c_max+1], dst F16 [c_max, nt].
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer MBuf { uint16_t data_m[]; };
+layout(binding = 1) readonly  buffer LBuf { int data_l[]; };
+layout(binding = 2) writeonly buffer DBuf { uint16_t data_d[]; };
+
+layout(push_constant) uniform Parameters {
+    uint c_max;
+    uint nt;
+    uint n_kv;
+    uint sm1;    // mask row stride in f16 elements
+    uint sd1;    // dst row stride in f16 elements
+} p;
+
+#define NEG_INF_F16 uint16_t(0xFC00)
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.c_max * p.nt) {
+        return;
+    }
+
+    const uint c = i % p.c_max;
+    const uint t = i / p.c_max;
+
+    const uint count = uint(data_l[p.c_max]);
+
+    uint16_t v = NEG_INF_F16;
+    if (c < count) {
+        const int cell = data_l[c];
+        if (cell >= 0 && uint(cell) < p.n_kv) {
+            v = data_m[t * p.sm1 + uint(cell)];
+        }
+    }
+    data_d[t * p.sd1 + c] = v;
+}

@@ -1,0 +1,40 @@
+#version 450
+
+// qwen4exp fused HC mix tail (mirrors ggml_compute_forward_q4x_hc_mix_collapse):
+//   out[i, t] = (1/hc) * sum_c xn[c*E + i, t] * sigmoid(up[c*E + i, t])
+// xn/up [hc*E, nt] contiguous f32 -> out [E, nt]. Replaces the unfused
+// sigmoid + mul + cont + (hc-1) adds + scale chain (~7 dispatches, x96/token
+// at decode). Flat elementwise over E * nt; the adds run in ascending-c order,
+// matching the unfused chain bit-for-bit.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer XBuf { float data_x[]; };
+layout(binding = 1) readonly  buffer UBuf { float data_u[]; };
+layout(binding = 2) writeonly buffer DBuf { float data_d[]; };
+
+layout(push_constant) uniform Parameters {
+    uint E;
+    uint hc;
+    uint ne;      // E * nt
+    uint sx1, su1, sd1;
+} p;
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint i = idx % p.E;
+    const uint t = idx / p.E;
+
+    float acc = 0.0;
+    for (uint c = 0; c < p.hc; ++c) {
+        const float u = data_u[t * p.su1 + c * p.E + i];
+        const float g = 1.0 / (1.0 + exp(-u));
+        acc += data_x[t * p.sx1 + c * p.E + i] * g;
+    }
+
+    data_d[t * p.sd1 + i] = acc / float(p.hc);
+}

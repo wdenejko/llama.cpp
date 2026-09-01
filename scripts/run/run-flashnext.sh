@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# Serve Qwen3.8-Flash-Next on the REBASED flashnext-v2 build (build-v2). MTP self-speculative
+# decode is OPT-IN. MEASURED on this box (build-v2, single stream):
+#   temp 0 + code:            base 25.7 -> MTP 35.6  (+39%), and the gain GROWS with depth:
+#   temp 0 + code @ ~32k:     16.1 -> 28.9 (+79%);   @ ~64k: 12.0 -> 25.8 (+115%).
+#   temp 1.0 + reasoning (2026-08-30, blk-topk build): MTP chat mean 31-32 t/s (peaks 38 on
+#     code-y prompts) vs ~26 without — the old "MTP is a wash at temp 1" is FIXED (it was
+#     partly the rollback quality bug + older build; stochastic spec sampling adds the rest).
+# Rule: MTP=1 is worth it at any temperature now; TEMP=0 remains the fastest for pure code.
+# Q4_K_XL is the only quant we keep. Creative sampling = unsloth thinking-mode rec.
+# Usage: [QUANT=Q4_K_XL|IQ4_XS] [CTX=131072] [NGL=99] [PORT=8080] [FA=on] [NGRAM_OFFLOAD=1] [REASONING=medium] [MTP=0] [TEMP=1.0] [PARALLEL=1] [UB=2048] [COOPMAT=1] [FREE_GPU=1] [UBD=512] [KVD=q8_0] [KV=<f16|q8_0>] [MD=<draft.gguf>] [SPEC_STOCH=1] [PMIN=0.75] [RSROLL=0] [BLKTOPK=1]
+# QUANT=IQ4_XS = the orcarouter Uncensored finetune (different weights, same arch).
+#   Creative/chat (default):     ./run-flashnext.sh
+#   Fast deterministic code:     MTP=1 TEMP=0 REASONING=none ./run-flashnext.sh
+#   Fast reasoning/creative:     MTP=1 ./run-flashnext.sh   (temp 1, stoch spec sampling auto-on)
+export PATH="$PATH:/usr/sbin:/sbin"
+TOOLBOX=llama-nudge-vulkan
+BIN=/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin   # rebased build WITH MTP (old build/ has NO MTP)
+MODELS=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF
+# remember whether the user pinned these before defaults land — the deep-ctx guard
+# below only auto-picks knobs the user left alone
+MD_USER="${MD:+1}"
+UB_USER="${UB:+1}"
+KV_USER="${KV:+1}"
+MD="${MD:-/home/wdenejko/models/Qwen3.8-Flash-Next-MTP-Q8_0-GGUF/Qwen3.8-Flash-Next-MTP-Q8_0.gguf}"  # MTP draft head (env-overridable)
+MDQ4=/home/wdenejko/models/Qwen3.8-Flash-Next-MTP-Q8_0-GGUF/Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf
+
+QUANT="${QUANT:-Q4_K_XL}"
+PORT="${PORT:-8080}"
+NGL="${NGL:-99}"
+CTX="${CTX:-131072}"                 # model supports up to 262144; MTP adds ~5GB, lower CTX if it OOMs at 128k
+FA="${FA:-on}"
+NGRAM_OFFLOAD="${NGRAM_OFFLOAD:-1}"  # 1 = keep the 28.8GB PLE table off GTT as an NVMe mmap (needed for Q4 + big ctx)
+REASONING="${REASONING:-medium}"     # xhigh|medium|low = think ON at that effort; none/off = think OFF.
+                                     # NB: this template rejects effort 'none' — none maps to --reasoning-budget 0
+                                     # (enable_thinking=false -> empty <think></think>), NOT --reasoning-effort none.
+TEMP="${TEMP:-1.0}"                  # 1.0 = creative default; set 0 for deterministic work (REQUIRED for MTP to help)
+MTP="${MTP:-0}"                      # 0 = plain base decode (right for temp 1.0); 1 = MTP (only useful at TEMP=0)
+
+# Deep-context guard (DEEPMTP=0 disables). MEASURED envelopes: the default Q8 draft is
+# proven to ~96k and host-OOMs ~129k; the Q4 draft covers 128k; KV=q8_0 (a <1% perf wash,
+# 36/48 layers are recurrent) frees ~3.9GB so 262k boots with UB=2048. The wall is host RAM,
+# not GTT — and it moves DURING use: KV pages acquire physical backing as context fills, so
+# the ub2048 boot fit dies to the OOM killer at ~192k of actual fill (measured mid-prefill).
+# UB=1024 gives the ~4GB back: full 252k fill validated (pp avg 209, decode 29, 2.8G spare).
+# Two-tier choice: jobs that stay under ~190k fill can pin UB=2048 for +10% shallow prefill.
+if [ "${DEEPMTP:-1}" != "0" ]; then
+  if [ "$MTP" = "1" ] && [ -z "$MD_USER" ] && [ "$CTX" -gt 98304 ] && [ -f "$MDQ4" ]; then
+    MD="$MDQ4"
+    echo "[run-flashnext] deep-ctx: CTX=$CTX > 98304 with MTP — switching to the Q4 draft (MD=<path> or DEEPMTP=0 overrides)" >&2
+  fi
+  if [ -z "$KV_USER" ] && [ "$CTX" -gt 131072 ]; then
+    KV=q8_0
+    echo "[run-flashnext] deep-ctx: CTX=$CTX > 131072 — KV=q8_0 frees ~3.9GB of host RAM (KV=f16 or DEEPMTP=0 overrides)" >&2
+  fi
+  if [ -z "$UB_USER" ] && [ "$CTX" -gt 196608 ]; then
+    UB=1024
+    echo "[run-flashnext] deep-ctx: CTX=$CTX > 196608 — UB=1024 so a full-depth fill survives (ub2048 host-OOMs at ~192k fill; UB=2048 to force, DEEPMTP=0 disables)" >&2
+  fi
+fi
+PARALLEL="${PARALLEL:-1}"            # 1 = single stream = fastest PER REQUEST; higher = concurrency but dilutes each
+UB="${UB:-2048}"                     # physical batch. MEASURED pp4096 on this box: 512->2048 is +25% coopmat-OFF
+                                     # (386->484) and +14% coopmat-ON (494->564); plateaus by 3072. ub2048 verified
+                                     # NON-OOM at full 131072 ctx (peak 87GB / 121GB free). Was 512.
+COOPMAT="${COOPMAT:-1}"              # KHR_coopmat matmul. 1 = ON (default): recovers prefill (measured ub2048:
+                                     # +16% at d0, +11% @32k — shrinks with depth), safe under MTP since 81aa39c17.
+                                     # 0 = force OFF (GGML_VK_DISABLE_COOPMAT=1) as a regression fallback.
+FREE_GPU="${FREE_GPU:-1}"            # 1 = stop comfyui/OCR + wait for GTT/RAM headroom before the ~103GB
+                                     # load, and restart them when the server exits. 0 = leave services be.
+
+case "$QUANT" in
+  Q4_K_XL) MODEL="$MODELS/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf" ;;
+  # orcarouter Uncensored finetune, IQ4_XS (97.5GB, ~8GB smaller than UD-Q4_K_XL — the margin
+  # that may let ub2048 survive a full 262k fill; validate before trusting deep). MTP draft is
+  # the base model's head: structurally fine (spec verify is lossless), acceptance may dip.
+  IQ4_XS)  MODEL="$HOME/models/Qwen3.8-Flash-Next-Uncensored-GGUF/IQ4_XS/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf" ;;
+  *)       MODEL="$MODELS/$QUANT" ;;
+esac
+if [ ! -f "$MODEL" ]; then
+  echo "[run-flashnext] quant/model not found: $MODEL" >&2
+  echo "[run-flashnext] only UD-Q4_K_XL is installed; see run-flashnext-q4.sh" >&2
+  exit 1
+fi
+
+OT_ARGS=()
+[ "$NGRAM_OFFLOAD" = "1" ] && OT_ARGS=(--override-tensor "per_layer_token_embd.weight=CPU")
+# reasoning control. This template has NO 'none' effort level — effort is only xhigh|medium|low and it
+# raise_exception()s on anything else. Thinking is turned OFF by enable_thinking=false, which the server
+# flag `--reasoning off` sets (verified: yields an empty <think></think> and pure output, no error).
+# So 'none'/'off' -> `--reasoning off`; any other value -> a real effort level.
+# The Uncensored finetune's template enforces the effort enum (xhigh is ITS default) and
+# raise_exception()s on 'high'. Remap so the muscle-memory REASONING=high still boots.
+if [ "$QUANT" = "IQ4_XS" ] && [ "$REASONING" = "high" ]; then
+  REASONING=xhigh
+  echo "[run-flashnext] IQ4_XS template: reasoning high -> xhigh (this template's levels: xhigh|medium|low)" >&2
+fi
+REASON_ARGS=()
+case "$REASONING" in
+  none|off|0) REASON_ARGS=(--reasoning off) ;;
+  *)          REASON_ARGS=(--reasoning on --reasoning-effort "$REASONING") ;;
+esac
+
+MTP_ARGS=()
+VK_ENV=()
+# COOPMAT=0 is a global kill switch forcing KHR_coopmat OFF (regression fallback). Default is ON.
+[ "$COOPMAT" = "0" ] && VK_ENV=(GGML_VK_DISABLE_COOPMAT=1)
+# pass experiment env vars into the toolbox (toolbox run does not forward the host env)
+for _v in GGML_TOPK_LOG GGML_VK_EVENT_DEVICE_WAIT GGML_VK_EVENT_TL_OFF GGML_VK_DISABLE_FUSION GGML_VK_PERF_LOGGER GGML_VK_PERF_LOGGER_FREQUENCY GGML_VK_DENSE_F16B GGML_VK_DENSE_WAVE32 RADV_PERFTEST \
+             GGML_VK_MMID_INT GGML_VK_MMID_F16B GGML_VK_MMID_SCALE_EPILOGUE GGML_VK_MMID_PROBE GGML_VK_MMID_COMPACT GGML_VK_DENSE_THIN_BM GGML_VK_MMID_BN48 GGML_VK_MMID_BK64 GGML_VK_MM_TILE_EPILOG GGML_VK_DENSE_BM256 GGML_VK_MMV_RM_STDQ GGML_VK_MMV_RM_KQ Q4X_SPEC_STOCH_TOPK Q4X_SPEC_STOCH_TEMP Q4X_HC_MIX_NOFUSE GGML_VK_MMID_SMALLN GGML_VK_MMID_BM64 GGML_VK_MEMORY_LOGGER; do
+  if [ -n "${!_v:-}" ]; then VK_ENV+=("$_v=${!_v}"); fi
+done
+# Q4X_RS_ROLLBACK: qwen4exp recurrent partial rollback (n_rs_seq=4). DEFAULT ON since the
+# conv snapshot-plane fix (2026-08-30): build_conv_state_at now fills planes 1..n_rs_seq of
+# both conv rows (delta-net + PLE) like the shared helper; the ssm planes already came from
+# the fused GDN op's K snapshots. Validated at the corruption repro (temp 1 + reasoning):
+# accept 86/78/70% == the checkpoint-path reference, coherent 1100-token gens, and
+# +19% decode (37.9 vs 31.9 t/s mean) from skipping the 112 MiB checkpoint restore per
+# rejection; temp-0 harness 10/10, 0 restores. RSROLL=0 falls back to checkpoint-restore
+# (exact but slower; its livelock risk is covered by the server-side guard either way).
+[ "${RSROLL:-1}" != "0" ] && VK_ENV+=(Q4X_RS_ROLLBACK=1)
+# Q4X_QSA_BLK_TOPK: block-level QSA indexer top-k. A/B 2026-08-30 (symmetric, 98k ctx): pp +25%
+# and tg +11% at 32-64k depth, pp +5% shallow, ~2GB less GTT at full ctx, needle retrieval
+# intact at 32k/64k, harness 10/10 — and the k=2051 CPU top_k fallback disappears (~14k
+# dispatches/run -> 0). Costs ~3pt draft acceptance (net tg still ahead). BLKTOPK=0 disables.
+[ "${BLKTOPK:-1}" != "0" ] && VK_ENV+=(Q4X_QSA_BLK_TOPK=1)
+# Q4X_QSA_GATHER: gathered QSA decode attention. OFF by default in the binary (honest A/B:
+# masked-dense wins at every depth - 47.0 vs 46.1 tg @32k, 45.3 vs 37.2 @48k; identity is
+# byte-equal, so this is purely a perf call). GATHER=N re-enables from N cells (1 = always).
+[ -n "${GATHER:-}" ] && VK_ENV+=(Q4X_QSA_GATHER="$GATHER")
+# Q4X_QSA_GP: gathered sparse PREFILL - per 128-token tile, dedup the top-k selections and
+# run FA over the gathered union instead of streaming the whole cache. Math-equal to
+# masked-dense (mask gathered from the same sparse mask). DEFAULT ON 2026-08-31 from 28k
+# depth: chain-segment marginals +6.2% @32-41k, +5.9% @41-49k, +10.3% @49-57k, +9.9%
+# @57-63k (MTP=1), fresh-40k prefill +2.9%; d0/decode untouched; needles 32k/64k all HIT,
+# harness 10/10, accept unchanged. NB single-2048-probe benches UNDERSTATE this lever -
+# judge it on >=6k marginal windows. GP=0 disables; GP=N moves the engage depth. GP_W tile
+# width (128 measured best; 512 worse), GP_FRAC list capacity as a fraction of n_kv
+# (default 0.62; union max measured 51.5% @32k / 47.4% @64k at W=128 - re-dump before
+# lowering or engaging shallower).
+GP="${GP:-28672}"
+[ "$GP" != "0" ]      && VK_ENV+=(Q4X_QSA_GP="$GP")
+[ -n "${GP_W:-}" ]    && VK_ENV+=(Q4X_QSA_GP_W="$GP_W")
+[ -n "${GP_FRAC:-}" ] && VK_ENV+=(Q4X_QSA_GP_FRAC="$GP_FRAC")
+# POOLED=0 disables the QSA pooled-key summary cache (default on in the binary; this is the
+# recompute-every-graph fallback for A/B and debugging).
+[ "${POOLED:-1}" = "0" ] && VK_ENV+=(LLAMA_QSA_NO_POOLED_CACHE=1)
+if [ "$MTP" = "1" ]; then
+  # draft-mtp ONLY. Do NOT add ngram-mod (its 48-64 tok drafts regress acceptance here).
+  # p-min 0.75 gates low-confidence drafts (keeps prose from regressing).
+  UBD="${UBD:-512}"   # draft-context physical batch. The draft otherwise inherits UB and reserves a
+                      # SECOND ub x n_ctx mask/compute set; 512 shrinks it 4x so the TARGET keeps
+                      # UB=2048 prefill (+11-13% pp vs ub512 at 0-64k). Decode-side cost: none.
+  KVD="${KVD:-q8_0}"  # draft KV cache type (1 attn layer; q8_0 halves it, ~120MB at 128k)
+  # VALIDATED ENVELOPE (2026-08-29): with the default Q8 draft, ub2048+MTP prefill is proven to ~96k
+  # (dies ~129k on a HOST oom-kill: 103GB model + drafts + deep transients fill the 128GB box).
+  # For genuinely deeper jobs pick ONE: MD=<...MTP-Q4_K_M.gguf> (frees 1.35GB, full 128k proven, but
+  # shallow decode drops 44->32 t/s at 74% accept, and the box peaks at free=0) or UB=512 (pp at 128k
+  # is within 6.5% of ub2048 anyway: 141.5 vs 150.7).
+  PMIN="${PMIN:-0.75}"  # draft confidence gate; tuned for greedy drafting — with SPEC_STOCH at
+                        # temp>0 the draft's max-prob is flatter, so a lower PMIN drafts deeper
+  # draft depth, temperature-conditional default (A/B'd 2026-08-30 both ways):
+  #   temp 0 (greedy): 6 beats 4 by +4-7% tg at 0/32k/64k (42.1/34.4/40.0 vs 39.3/32.9/38.0);
+  #     the accept drop (88->80%) loses to the longer drafts.
+  #   temp>0 (stochastic spec): 4 beats 6 by +2.4% mean / +6% on code (33.73 vs 32.93; accept
+  #     81->68% on code) - sampled drafts diverge at depth 5-6 and rejections discard more.
+  # NB the Vulkan mat-vec shaders batch at most 8 columns, so keep NMAX+1 <= 8 or every
+  # verify matmul falls off a ~2.7x cliff.
+  case "$TEMP" in
+    0|0.0) NMAX="${NMAX:-6}" ;;
+    *)     NMAX="${NMAX:-4}" ;;
+  esac
+                        # (apepojken fork measurement); 6 was their sweet spot at ~0.9 accept
+  MTP_ARGS=(-md "$MD" --spec-type draft-mtp --spec-draft-n-max "$NMAX" --spec-draft-p-min "$PMIN"
+            --spec-draft-ubatch "$UBD" --spec-draft-type-k "$KVD" --spec-draft-type-v "$KVD")
+  # Q4X_SPEC_STOCH: stochastic speculative sampling — the draft SAMPLES with the target's
+  # sampling params and the server verifies by rejection sampling (lossless for the target
+  # distribution). Recovers the MTP speedup at temp>0, where exact-match verification made it
+  # a wash. No effect at TEMP=0 (falls back to greedy semantics). SPEC_STOCH=0 disables.
+  [ "${SPEC_STOCH:-1}" != "0" ] && [ "${TEMP:-0}" != "0" ] && VK_ENV+=(Q4X_SPEC_STOCH=1)
+  # HISTORY: coopmat under MTP used to DEADLOCK the GPU — a KHR_coopmat matmul shader's Vulkan fence never
+  # signalled on the small speculative batch shapes (llama_decode spun in ggml_vk_wait_for_fence, no
+  # device-lost). FIXED 2026-08-29 by ordering the cross-backend event wait through its timeline semaphore
+  # (commit 81aa39c17). VALIDATED: coopmat-ON MTP ran 20 min / 84 code gens with 0 deadlocks, 0 livelocks,
+  # 0 stalls at full decode speed (32-37 t/s). The old OFF workaround is now opt-in via COOPMAT=0. The
+  # coopmat-ON graph init is GTT-sensitive under memory pressure -> see the launch preamble below.
+  # NB the old "MTP is a wash above temp 0" warning is DEAD: with stochastic speculative
+  # sampling (auto-on at TEMP>0) MTP measured 37.9 vs ~26 t/s at temp 1. Only warn when the
+  # user disabled stoch by hand — exact-match verify at temp>0 really is a wash.
+  if [ "${SPEC_STOCH:-1}" = "0" ] && [ "$TEMP" != "0" ] && [ "$TEMP" != "0.0" ]; then
+    echo "[run-flashnext] WARNING: MTP=1 + SPEC_STOCH=0 at TEMP=$TEMP is a wash (exact-match verify only accepts at ~p)." >&2
+    echo "[run-flashnext]          Drop SPEC_STOCH=0, or set TEMP=0, or use MTP=0 to save ~4GB on the draft model." >&2
+  fi
+fi
+
+echo "[run-flashnext] build=build-v2 quant=$QUANT ctx=$CTX ngl=$NGL fa=$FA port=$PORT ngram_offload=$NGRAM_OFFLOAD reasoning=$REASONING temp=$TEMP mtp=$MTP coopmat=$COOPMAT free_gpu=$FREE_GPU parallel=$PARALLEL" >&2
+
+# Don't stack a second server on the coopmat-ON MTP path: its graph init can wedge graph_reserve into an
+# unkillable amdgpu D-state (needs a GPU reset/reboot) when a prior server's GTT is still held.
+if [ "$MTP" = "1" ] && [ "$COOPMAT" != "0" ] && pgrep -f "build-v2/bin/[l]lama-server" >/dev/null 2>&1; then
+  echo "[run-flashnext] a build-v2 llama-server is already running — stop it before launching coopmat-ON MTP." >&2
+  exit 1
+fi
+
+# Clean shutdown: kill the server and (if we stopped them) restart the user's services. The server runs
+# inside the toolbox via `toolbox run`; a signal to this script kills the toolbox-run client but can ORPHAN
+# the containerized llama-server (podman only forwards the signal with a TTY), leaving it holding ~85GB GTT
+# while the services come back = contention. So pkill it explicitly (the toolbox shares the host PID ns).
+# Fires on normal exit and on Ctrl-C/TERM; defined AFTER the refuse-check above so it never touches a
+# pre-existing server.
+_FREED=0
+_shutdown() {
+  pkill -f "build-v2/bin/[l]lama-server" 2>/dev/null || true
+  if [ "$_FREED" = "1" ]; then
+    sleep 2
+    echo "[run-flashnext] restarting comfyui + OCR" >&2
+    systemctl --user start dashi-unlimited-ocr.service comfyui.service 2>/dev/null || true
+  fi
+}
+trap _shutdown EXIT INT TERM
+
+# Free GPU/host memory for the ~103GB model: stop comfyui/OCR and wait for headroom (restored on exit above).
+if [ "$FREE_GPU" = "1" ]; then
+  echo "[run-flashnext] stopping comfyui + OCR to free memory (FREE_GPU=0 to skip)" >&2
+  systemctl --user stop dashi-unlimited-ocr.service comfyui.service 2>/dev/null || true
+  _FREED=1
+  _gttf=$(ls /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1)
+  g=0; a=0
+  for _ in $(seq 1 40); do            # up to ~80s for GTT to drain and RAM headroom for the load
+    g=$(( $(cat "$_gttf" 2>/dev/null)/1073741824 )); a=$(free -g | awk '/^Mem:/{print $7}')
+    [ "$g" -lt 6 ] && [ "$a" -ge 110 ] && break
+    sleep 2
+  done
+  echo "[run-flashnext] memory ready: gtt=${g}GB free_ram=${a}GB" >&2
+elif [ "$MTP" = "1" ] && [ "$COOPMAT" != "0" ]; then
+  # FREE_GPU off but coopmat-ON: still let a just-exited server's GTT finish draining before graph init.
+  _gtt() { echo $(( $(cat /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1) / 1073741824 )); }
+  _prev=$(_gtt); _stable=0
+  for _ in $(seq 1 15); do
+    sleep 2; _cur=$(_gtt)
+    if [ "$_cur" -le "$_prev" ]; then _stable=$((_stable+1)); else _stable=0; fi
+    [ "$_stable" -ge 2 ] && break
+    _prev=$_cur
+  done
+  echo "[run-flashnext] gtt=$(_gtt)GB stable" >&2
+fi
+
+# Start the toolbox — restart it fresh on the coopmat-ON MTP path so graph init sees a clean container.
+if [ "$MTP" = "1" ] && [ "$COOPMAT" != "0" ]; then
+  podman restart "$TOOLBOX" >/dev/null 2>&1 || podman start "$TOOLBOX" >/dev/null 2>&1 || true
+  sleep 2
+else
+  podman start "$TOOLBOX" >/dev/null 2>&1 || true
+fi
+
+# NOTE: intentionally NOT `exec` — the shell must stay alive so the FREE_GPU trap restarts comfyui/OCR
+# when the server exits or is interrupted.
+VERBOSE_ARGS=()
+[ "${VERBOSE:-0}" = "1" ] && VERBOSE_ARGS=(--verbose)
+# KV=q8_0 quantizes the TARGET's KV caches (12 attn layers 6144MiB->3264 + indexer 2304->1224 at
+# 262k). Perf is a wash (36/48 layers are recurrent) but it frees ~3.9GB — the difference between
+# fitting and host-OOM for 262k + UB=2048 + the Q4 draft on the 128GB box. Empty = f16.
+KV_ARGS=()
+[ -n "${KV:-}" ] && KV_ARGS=(-ctk "$KV" -ctv "$KV")
+toolbox run --container "$TOOLBOX" env "${VK_ENV[@]}" LD_LIBRARY_PATH="$BIN" \
+  "$BIN/llama-server" -m "$MODEL" "${VERBOSE_ARGS[@]}" \
+    --alias flashnext --host 0.0.0.0 --port "$PORT" \
+    -ngl "$NGL" -c "$CTX" -ub "$UB" --flash-attn "$FA" "${KV_ARGS[@]}" "${OT_ARGS[@]}" --metrics \
+    --parallel "$PARALLEL" \
+    --temp "$TEMP" --top-p 0.95 --top-k 20 --min-p 0.0 \
+    --presence-penalty 0.0 --repeat-penalty 1.0 \
+    "${REASON_ARGS[@]}" \
+    "${MTP_ARGS[@]}"

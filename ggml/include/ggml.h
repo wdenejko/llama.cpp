@@ -574,6 +574,11 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_Q4X_HC_COMBINE,
+        GGML_OP_Q4X_QSA_UNION,
+        GGML_OP_Q4X_QSA_MASK_GATHER,
+        GGML_OP_Q4X_QSA_KV_GATHER,
+        GGML_OP_Q4X_HC_MIX_COLLAPSE,
 
         GGML_OP_UNARY,
 
@@ -2653,6 +2658,52 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // qwen4exp fused hyper-connection combine (mirrors build_hc_combine):
+    //   out[i, h, t] = residual[i, h, t] + block_out[i, t] * 2*sigmoid(inject[h, t] / hc)
+    // residual [n_embd, hc, n_tokens], block_out [n_embd, n_tokens], inject [hc, n_tokens]
+    // -> [n_embd, hc, n_tokens]; hc comes from residual->ne[1], the 1/hc and 2x are baked in.
+    // [Q4X] deduplicated union of the selected KV cells of a query tile.
+    // top_k: I32 [n_sel, W] (per-token selected cell ids, may be strided in dim1).
+    // result: I32 [c_max + 1]: ascending unique cells in [0, n_kv), padded with 0;
+    // [c_max] holds the true union count (may exceed c_max if the cap clipped).
+    GGML_API struct ggml_tensor * ggml_q4x_qsa_union(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * top_k,
+            int32_t               n_kv,
+            int32_t               c_max);
+
+    // [Q4X] gather mask columns for the union list: out[c, t] =
+    // c < count ? mask[list[c], t] : -inf, where count = list[c_max].
+    // mask: F16 [n_kv, W] (dim1 may be strided), list: I32 [c_max + 1].
+    // result: F16 [c_max, W].
+    GGML_API struct ggml_tensor * ggml_q4x_qsa_mask_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * list);
+
+    // [Q4X] gathered sparse prefill: out[:, c] = rows[:, list[c]] (f16 row gather,
+    // list pads point at row 0 - the -inf mask entries from q4x_qsa_mask_gather
+    // make those rows inert). rows [row_sz, n_rows] strided, list I32 [c_max+1]
+    // from ggml_q4x_qsa_union -> dst F16 [row_sz, c_max] contiguous.
+    GGML_API struct ggml_tensor * ggml_q4x_qsa_kv_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * rows,
+            struct ggml_tensor  * list);
+
+    // [Q4X] qwen4exp HC mix tail: out[i,t] = (1/hc) * sum_c xn[c*E+i,t] * sigmoid(up[c*E+i,t])
+    // where E = xn->ne[0]/hc. Replaces sigmoid+mul+cont+(hc-1) adds+scale.
+    GGML_API struct ggml_tensor * ggml_q4x_hc_mix_collapse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * xn,
+            struct ggml_tensor  * up,
+            int32_t               hc);
+
+    GGML_API struct ggml_tensor * ggml_q4x_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * inject);
 
     // custom operators
 

@@ -64,10 +64,18 @@ layout (binding = 0) readonly buffer A_PACKED32 {A_TYPE_PACKED32 data_a_packed32
 layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
 layout (binding = 1) readonly buffer B_SCALAR {B_TYPE_SCALAR data_b_scalar[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
+#ifndef MUL_MAT_ID
+// [MM_TILE_EPILOG] operand of a fused trailing MUL. Always bound (dummy when
+// unused); read only when fusion_flags bit 2 is set. Same shape/stride as D.
+layout (binding = 3) readonly buffer FMUL {float data_fmul[];};
+#endif
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+// Fused MUL epilogue: one scale per (expert slot, token), broadcast down the M dimension.
+// Always bound; p.fusion_flags == 0 means ignore it.
+layout (binding = 5) readonly buffer FusedScale {float data_fscale[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -88,6 +96,14 @@ layout (push_constant) uniform parameter
     uint nei1;
     uint nbi1;
     uint ne11;
+    // padded_N predates the K-padding switch (#27925); it stays as pc-layout filler so the
+    // one host-side vk_mat_mat_id_push_constants struct serves every mmid shader.
+    uint padded_N;
+    uint use_row_lists;
+    uint fusion_flags;
+    // [MMID_COMPACT] 0 = z-slice-per-expert dispatch; else the index (in the counts buffer)
+    // of a live-tile list, and WorkGroupID.y indexes (expert << 16 | tile) entries
+    uint tile_list_base;
     uint n_experts;
     uint hoist_row_ids;
 #else
@@ -98,6 +114,11 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint padded_N;
+    // [MM_TILE_EPILOG] 0x1 = sigmoid, 0x2 = silu; scales apply before/after
+    uint fusion_flags;
+    float fuse_scale_pre;
+    float fuse_scale_post;
 #endif
 } p;
 
@@ -132,6 +153,21 @@ const bool APPLY_SLM_A_RESHAPE = false;
 shared FLOAT_TYPEV2 buf_a[BM * SHMEM_STRIDE];
 shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
 
+#if defined(MUL_MAT_ID) && (defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K))
+// Per-tile-row (d, m) for the current BK chunk. A BK=32 chunk of one row never
+// straddles a q4_K/q5_K sub-block (8 idx span 14 of a 16-wide half), so the
+// packed 6-bit scale extraction can run once per row per superblock instead of
+// once per 4-weight load (8x redundant across the loading lanes). Both types
+// share the dm + scales[12] block prefix, so one fill serves both.
+// Disabled 2026-07-28: measured a pure loss on the current stack (Qwen3.6-35B Q5_K,
+// RADV gfx1151): -4% pp512@ub512, -20% pp2048@ub2048 vs the cache off; decode unaffected.
+// The July-14 win it was added for did not survive the later tile/rebase changes.
+#define MMID_QK_SCACHE 0
+// 8 sub-block (d, m) pairs per tile row, refilled once per superblock (every
+// 8th BK=32 iteration) so 7 of 8 iterations pay no fill or extra barrier.
+shared vec2 scache_dm[BM * 8];
+#endif
+
 #define NUM_WARPS (BLOCK_SIZE / WARP)
 
 #ifdef COOPMAT
@@ -142,13 +178,32 @@ shared ACC_TYPE coopmat_stage[TM * TN * NUM_WARPS];
 #include "mul_mm_funcs.glsl"
 
 void main() {
-    const uint ic = gl_WorkGroupID.y;
-
 #ifdef MUL_MAT_ID
-    const uint expert_idx = gl_WorkGroupID.z;
-    if (ic * BN >= data_expert_count[expert_idx]) {
-        return;
+    // [MMID_COMPACT] with a tile list the grid is flat over live (expert, tile) pairs, so the
+    // ~97% of z-slice workgroups whose tile lies past their expert's row count never launch.
+    // n_as is recovered from the list base (it sits after [counts][offsets][cursors][entries]).
+    uint ic_v, expert_idx_v, n_as_v;
+    if (p.tile_list_base != 0) {
+        n_as_v = (p.tile_list_base - 1 - p.nei0 * p.nei1) / 3;
+        const int tl = data_expert_count[p.tile_list_base + gl_WorkGroupID.y];
+        if (tl < 0) {
+            return;
+        }
+        expert_idx_v = uint(tl) >> 16;
+        ic_v = uint(tl) & 0xffffu;
+    } else {
+        n_as_v = gl_NumWorkGroups.z;
+        ic_v = gl_WorkGroupID.y;
+        expert_idx_v = gl_WorkGroupID.z;
+        if (ic_v * BN >= data_expert_count[expert_idx_v]) {
+            return;
+        }
     }
+    const uint ic = ic_v;
+    const uint expert_idx = expert_idx_v;
+    const uint mmid_n_as = n_as_v;
+#else
+    const uint ic = gl_WorkGroupID.y;
 #endif
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
@@ -216,7 +271,9 @@ void main() {
     const uint loadstride_b = gl_WorkGroupSize.x * LOAD_VEC_B_EFF * LOAD_VEC_BATCH_B / BK;
 
 #ifdef MUL_MAT_ID
-    if (p.hoist_row_ids != 0) {
+    if (p.use_row_lists != 0) {
+        load_row_ids_from_lists(mmid_n_as, expert_idx, ic);
+    } else if (p.hoist_row_ids != 0) {
         load_row_ids_hoisted(expert_idx, ic);
     } else {
 #ifdef MUL_MAT_ID_USE_SUBGROUPS
@@ -291,15 +348,46 @@ void main() {
 #endif
 
     for (uint block = start_k; block < end_k; block += BK) {
+#ifdef MMID_QK_SCACHE
+        // refill all 8 sub-block (d, m) pairs per row at each superblock boundary
+        if ((block & 255) == 0) {
+            for (uint x = gl_LocalInvocationID.x; x < BM * 8; x += gl_WorkGroupSize.x) {
+                const uint r  = x / 8;
+                const uint is = x % 8;
+                const uint idx = pos_a + r * (p.stride_a / LOAD_VEC_A);
+                const uint ib = idx / 64;
+
+                const vec2 loadd = vec2(data_a[ib].dm);
+                const uvec3 scales = uvec3(data_a_packed32[ib].scales[0],
+                                           data_a_packed32[ib].scales[1],
+                                           data_a_packed32[ib].scales[2]);
+                const uint scalesoffs = (is & 3) * 8;
+                const uint scidx0 = (is < 4) ? 0 : 2;
+                const uint scidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+                const uint mbidx0 = (is < 4) ? 1 : 2;
+                const uint mbidxshift0 = (is < 4) ? scalesoffs : scalesoffs + 4;
+                const uint mbidxshift1 = (is < 4) ? scalesoffs : scalesoffs + 2;
+                const uint sc    = ((scales[scidx0] >> scalesoffs) & 0xF) | ((scales[0] >> scidxshift1) & 0x30);
+                const uint mbyte = ((scales[mbidx0] >> mbidxshift0) & 0xF) | ((scales[1] >> mbidxshift1) & 0x30);
+
+                scache_dm[x] = vec2(loadd.x * sc, -loadd.y * mbyte);
+            }
+            barrier();
+        }
+#endif
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
         }
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
+            // BN that is not a multiple of the load stride (e.g. the 48-wide mmid tile)
+            // leaves the last stride partial; the compare folds away for the pow2 tiles
+            if (BN % loadstride_b == 0 || loadc_b + l < BN) {
 #if !defined(MUL_MAT_ID)
-            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
+                load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
 #else
-            load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
+                load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
 #endif
+            }
         }
 
         barrier();
@@ -375,6 +463,40 @@ void main() {
 #endif
 #endif
 
+#ifndef MUL_MAT_ID
+    // [MM_TILE_EPILOG] fused [scale] sigmoid|silu [scale], computed in f32 on the
+    // accumulators. split_k never runs with fusion, so the sums are complete here.
+    if (p.fusion_flags != 0u) {
+        const bool ep_unary = (p.fusion_flags & 3u) != 0u;
+        const bool ep_silu  = (p.fusion_flags & 2u) != 0u;
+#ifdef COOPMAT
+        [[unroll]] for (uint j = 0; j < cms_per_row * cms_per_col; j++) {
+            [[unroll]] for (uint i = 0; i < sums[j].length(); ++i) {
+                float fv = float(sums[j][i]) * p.fuse_scale_pre;
+                if (ep_unary) {
+                    const float sig = 1.0f / (1.0f + exp(-fv));
+                    fv = ep_silu ? fv * sig : sig;
+                }
+                sums[j][i] = ACC_TYPE(fv * p.fuse_scale_post);
+            }
+        }
+#else
+        [[unroll]] for (uint i = 0; i < WMITER*TM*WNITER*TN/2; i++) {
+            float fx = float(sums[i].x) * p.fuse_scale_pre;
+            float fy = float(sums[i].y) * p.fuse_scale_pre;
+            if (ep_unary) {
+                const float sx = 1.0f / (1.0f + exp(-fx));
+                const float sy = 1.0f / (1.0f + exp(-fy));
+                fx = ep_silu ? fx * sx : sx;
+                fy = ep_silu ? fy * sy : sy;
+            }
+            sums[i].x = ACC_TYPE(fx * p.fuse_scale_post);
+            sums[i].y = ACC_TYPE(fy * p.fuse_scale_post);
+        }
+#endif
+    }
+#endif
+
     const uint dr = ir * BM + warp_r * WM;
     const uint dc = ic * BN + warp_c * WN;
 
@@ -394,9 +516,13 @@ void main() {
                 if (row_i >= _ne1) break;
 
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
-
                 if (dr + cm_row * TM + store_r < p.M) {
-                    data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr + cm_row * TM + store_r;
+                    if (p.fusion_flags != 0) {
+                        data_d[didx] = D_TYPE(float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]) * data_fscale[row_idx.y * p.nei0 + row_idx.x]);
+                    } else {
+                        data_d[didx] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    }
                 }
             }
             barrier();
@@ -409,17 +535,23 @@ void main() {
         [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
             const bool is_in_bounds = dr + (cm_row + 1) * TM <= p.M && dc + (cm_col + 1) * TN <= p.N;
 
-            if (is_aligned && is_in_bounds) {
+            // [MM_TILE_EPILOG] a fused trailing MUL needs per-element indices, so it
+            // routes through the staged paths below instead of the direct coopMatStore
+            const bool ep_mul = (p.fusion_flags & 4u) != 0u;
+            if (is_aligned && is_in_bounds && !ep_mul) {
                 // Full coopMat is within bounds and stride_d is aligned with 16B
                 coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> cm_dtype = coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums[cm_col * cms_per_row + cm_row]);
                 coopMatStore(cm_dtype, data_d, offsets + (dc + cm_col * TN) * p.stride_d + dr + cm_row * TM, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
             } else if (is_in_bounds) {
-                // Full coopMat is within bounds, but stride_d is not aligned
+                // Full coopMat is within bounds (staged: unaligned stride or fused MUL)
                 coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
 
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
-                    data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    const uint didx = offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r;
+                    float sv = float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    if (ep_mul) { sv *= data_fmul[didx]; }
+                    data_d[didx] = D_TYPE(sv);
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
             } else if (dr + cm_row * TM < p.M && dc + cm_col * TN < p.N) {
@@ -429,7 +561,10 @@ void main() {
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
                     if (dr + cm_row * TM + store_r < p.M && dc + cm_col * TN + col + store_c < p.N) {
-                        data_d[offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r] = D_TYPE(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                        const uint didx = offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r;
+                        float sv = float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                        if (ep_mul) { sv *= data_fmul[didx]; }
+                        data_d[didx] = D_TYPE(sv);
                     }
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
@@ -449,22 +584,28 @@ void main() {
                 if (row_i >= _ne1) break;
 
                 const u16vec2 row_idx = row_ids[row_i - ic * BN];
+                const bool do_scale = p.fusion_flags != 0;
+                const float fscale = do_scale ? data_fscale[row_idx.y * p.nei0 + row_idx.x] : 1.0f;
 #endif // MUL_MAT_ID
                 [[unroll]] for (uint cr = 0; cr < TM / 2; cr++) {
                     const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
 #ifdef MUL_MAT_ID
                     if (dr_warp + 2 * cr < p.M) {
-                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x);
+                        const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr;
+                        data_d[didx] = do_scale ? D_TYPE(float(sums[sums_idx].x) * fscale) : D_TYPE(sums[sums_idx].x);
                     }
                     if (dr_warp + 2 * cr + 1 < p.M) {
-                        data_d[row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y);
+                        const uint didx = row_idx.y * p.batch_stride_d + row_idx.x * p.stride_d + dr_warp + 2 * cr + 1;
+                        data_d[didx] = do_scale ? D_TYPE(float(sums[sums_idx].y) * fscale) : D_TYPE(sums[sums_idx].y);
                     }
 #else
                     if (dr_warp + 2 * cr < p.M && dc_warp + cc < p.N) {
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr] = D_TYPE(sums[sums_idx].x);
+                        const uint didx = offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr;
+                        data_d[didx] = ((p.fusion_flags & 4u) != 0u) ? D_TYPE(float(sums[sums_idx].x) * data_fmul[didx]) : D_TYPE(sums[sums_idx].x);
                     }
                     if (dr_warp + 2 * cr + 1 < p.M && dc_warp + cc < p.N) {
-                        data_d[offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr + 1] = D_TYPE(sums[sums_idx].y);
+                        const uint didx = offsets + (dc_warp + cc) * p.stride_d + dr_warp + 2 * cr + 1;
+                        data_d[didx] = ((p.fusion_flags & 4u) != 0u) ? D_TYPE(float(sums[sums_idx].y) * data_fmul[didx]) : D_TYPE(sums[sums_idx].y);
                     }
 #endif // MUL_MAT_ID
                 }

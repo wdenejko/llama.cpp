@@ -4113,6 +4113,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--spec-draft-ubatch", "-ubd", "--ubatch-size-draft"}, "N",
+        string_format("physical batch size for the draft model context (default: %d, 0 = inherit the target's)", params.speculative.draft.n_ubatch),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH").set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
             parse_tensor_buffer_overrides(value, params.speculative.draft.tensor_buft_overrides);
@@ -4185,6 +4192,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.synth_rates = std::move(rates);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
+    add_opt(common_arg(
+        {"--spec-draft-adaptive"},
+        "size the draft length adaptively from recent acceptance, within [n-min, n-max]",
+        [](common_params & params) {
+            params.speculative.draft.adaptive = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_ADAPTIVE"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",

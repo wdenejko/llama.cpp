@@ -1,0 +1,88 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+// qwen4exp gathered sparse prefill, step 1 (mirrors ggml_compute_forward_q4x_qsa_union):
+// bitmap-dedup union of the QSA indexer's selected KV cells across one tile of
+// nt query tokens. src0 = top_k I32 [n_sel, nt] (strided rows), dst = I32 [c_max+1]:
+// ascending unique cell list capped at c_max, pads = 0, dst[c_max] = true union size
+// (may exceed c_max - the consumer treats entries < min(count, c_max) as valid).
+// Single workgroup; shared bitmap covers n_kv <= 262144 cells (32 KiB LDS).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer TBuf { int data_t[]; };
+layout(binding = 1) writeonly buffer DBuf { int data_d[]; };
+
+layout(push_constant) uniform Parameters {
+    uint n_sel;
+    uint nt;
+    uint nbt1;    // top_k row stride in i32 elements
+    uint n_kv;
+    uint c_max;
+} p;
+
+#define BITMAP_WORDS 8192
+#define WORDS_PER_THREAD (BITMAP_WORDS / 256)
+
+shared uint bitmap[BITMAP_WORDS];
+shared uint counts[256];
+shared uint offsets[256];
+shared uint s_total;
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+
+    [[unroll]] for (uint w = 0; w < WORDS_PER_THREAD; ++w) {
+        bitmap[tid * WORDS_PER_THREAD + w] = 0u;
+    }
+    barrier();
+
+    const uint total = p.n_sel * p.nt;
+    for (uint i = tid; i < total; i += 256) {
+        const uint row = i / p.n_sel;
+        const uint col = i % p.n_sel;
+        const int  v   = data_t[row * p.nbt1 + col];
+        if (v >= 0 && uint(v) < p.n_kv) {
+            atomicOr(bitmap[uint(v) >> 5], 1u << (uint(v) & 31u));
+        }
+    }
+    barrier();
+
+    uint cnt = 0;
+    [[unroll]] for (uint w = 0; w < WORDS_PER_THREAD; ++w) {
+        cnt += bitCount(bitmap[tid * WORDS_PER_THREAD + w]);
+    }
+    counts[tid] = cnt;
+    barrier();
+
+    if (tid == 0) {
+        uint acc = 0;
+        for (uint i = 0; i < 256; ++i) {
+            offsets[i] = acc;
+            acc += counts[i];
+        }
+        s_total = acc;
+        data_d[p.c_max] = int(acc);
+    }
+    barrier();
+
+    // zero-fill the pad region
+    for (uint i = s_total + tid; i < p.c_max; i += 256) {
+        data_d[i] = 0;
+    }
+
+    uint pos = offsets[tid];
+    for (uint w = 0; w < WORDS_PER_THREAD; ++w) {
+        uint bits = bitmap[tid * WORDS_PER_THREAD + w];
+        const uint base = (tid * WORDS_PER_THREAD + w) << 5;
+        while (bits != 0u) {
+            const uint b = findLSB(bits);
+            bits &= bits - 1u;
+            if (pos < p.c_max) {
+                data_d[pos] = int(base + b);
+            }
+            pos++;
+        }
+    }
+}

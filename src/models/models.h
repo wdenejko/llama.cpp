@@ -2285,7 +2285,10 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+    protected:
+        // members only, no trunk: graph_mtp builds its own single block
+        graph(const llama_model & model, const llm_graph_params & params, bool mtp);
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2310,13 +2313,51 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int * sections,
                             int   il);
 
+        // [TAG_QSA_GATHER] what build_qsa_top_k selected; top_k == nullptr means dense
+        struct qsa_selection {
+            ggml_tensor * top_k    = nullptr;   // I32 [n_sel, n_tps, 1, n_stream]
+            ggml_tensor * sel_bias = nullptr;   // F32 [1, n_sel, n_tps, n_stream]; -inf on duplicated slots
+            int64_t       width    = 0;         // leading entries that are the reference selection
+        };
+
         // dense self-attention restricted to the cells that top_k names
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * top_k,
+            const qsa_selection & sel,
+                          float   kq_scale,
+                            int   il);
+
+        // [TAG_QSA_GATHER] padded row count of a gathered decode selection, or 0 for the
+        // masked-dense path; one gate decides both the selection width and the attention path
+        int64_t qsa_gather_n_sel(int64_t n_kv, int64_t width, int64_t r) const;
+
+        // gather the selected KV rows into contiguous f16 tensors and run dense flash
+        // attention over them, instead of masking the full cache
+        ggml_tensor * build_attn_qsa_gather(
+                    ggml_tensor * k,
+                    ggml_tensor * v,
+                    ggml_tensor * kq_mask,
+                    ggml_tensor * q_cur,
+            const qsa_selection & sel,
+                          float   kq_scale,
+                            int   il);
+
+        // [TAG_QSA_GP] gathered sparse PREFILL: per W-token tile, dedup the tile's top-k
+        // selections into one cell list, gather those K/V rows and the sparse mask, and run
+        // dense flash attention over the C gathered cells instead of streaming the whole
+        // cache. Math-equal to the masked-dense path: the mask is gathered from the same
+        // sparse kq_mask_top_k, so per-token visibility is unchanged.
+        ggml_tensor * build_attn_qsa_gather_prefill(
+                    ggml_tensor * k,
+                    ggml_tensor * v,
+                    ggml_tensor * kq_mask_sparse,
+                    ggml_tensor * q_cur,
+            const qsa_selection & sel,
+                        int64_t   W,
+                        int64_t   C,
                           float   kq_scale,
                             int   il);
 
@@ -2324,8 +2365,8 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense
-        ggml_tensor * build_qsa_top_k(
+        // QSA: token indices this layer's queries may attend to, or a dense (null) selection
+        qsa_selection build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
@@ -2375,6 +2416,10 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+    };
+
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

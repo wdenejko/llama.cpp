@@ -331,12 +331,32 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    bool adaptive = false; // adaptive draft length: size from recent acceptance, within [n_min, n_max]
+
+    // stochastic drafting for temp>0 speculative sampling: the drafter samples from a chain
+    // mirroring the target's sampling params (instead of taking its argmax) and reports each
+    // drafted token's candidate distribution, so the verifier can run lossless rejection
+    // sampling (accept w.p. min(1, p_tgt/q_dft)). exact-match verification collapses at
+    // temp>0 (accept rate = p(token)); this recovers rate ~= sum min(p, q).
+    // configured by common_speculative_init_result from the target sampling params.
+    bool     stoch       = false;
+    float    stoch_temp  = 1.0f;
+    int32_t  stoch_top_k = 40;
+    float    stoch_top_p = 0.95f;
+    float    stoch_min_p = 0.0f;
+    uint32_t stoch_seed  = 0;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
+
+    int32_t n_ubatch = 0; // physical batch size for the draft context (0 = inherit the target's).
+                          // a smaller draft ubatch shrinks the draft's ubatch-scaled compute/mask
+                          // buffers (llama_decode splits larger batches internally), which matters
+                          // when the draft shares a memory budget with the target (e.g. UMA/APU)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V

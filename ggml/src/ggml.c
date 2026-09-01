@@ -1083,6 +1083,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "Q4X_HC_COMBINE",
+    "Q4X_QSA_UNION",
+    "Q4X_QSA_MASK_GATHER",
+    "Q4X_QSA_KV_GATHER",
+    "Q4X_HC_MIX_COLLAPSE",
 
     "UNARY",
 
@@ -1100,7 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1203,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "q4x_hc_combine(residual, block_out, inject)",
+    "q4x_qsa_union(top_k)",
+    "q4x_qsa_mask_gather(mask, list)",
+    "q4x_qsa_kv_gather(rows, list)",
+    "q4x_hc_mix_collapse(xn, up)",
 
     "unary(x)",
 
@@ -1215,7 +1225,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6504,6 +6514,131 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_q4x_hc_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * block_out,
+        struct ggml_tensor  * inject) {
+    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type    == GGML_TYPE_F32);
+
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = residual->ne[2];
+
+    GGML_ASSERT(hc > 0);
+    GGML_ASSERT(residual->ne[3] == 1);
+
+    GGML_ASSERT(block_out->ne[0] == n_embd);
+    GGML_ASSERT(block_out->ne[1] == n_tokens);
+    GGML_ASSERT(block_out->ne[2] == 1);
+    GGML_ASSERT(block_out->ne[3] == 1);
+
+    GGML_ASSERT(inject->ne[0] == hc);
+    GGML_ASSERT(inject->ne[1] == n_tokens);
+    GGML_ASSERT(inject->ne[2] == 1);
+    GGML_ASSERT(inject->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+
+    result->op     = GGML_OP_Q4X_HC_COMBINE;
+    result->src[0] = residual;
+    result->src[1] = block_out;
+    result->src[2] = inject;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_q4x_qsa_union(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * top_k,
+        int32_t               n_kv,
+        int32_t               c_max) {
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(top_k->ne[2] == 1 && top_k->ne[3] == 1);
+    GGML_ASSERT(n_kv > 0 && c_max > 0);
+    GGML_ASSERT(top_k->nb[0] == sizeof(int32_t));
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) c_max + 1);
+
+    ggml_set_op_params_i32(result, 0, n_kv);
+    ggml_set_op_params_i32(result, 1, c_max);
+
+    result->op     = GGML_OP_Q4X_QSA_UNION;
+    result->src[0] = top_k;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_q4x_qsa_mask_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * list) {
+    GGML_ASSERT(mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(list->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(list));
+    GGML_ASSERT(mask->nb[0] == sizeof(ggml_fp16_t));
+
+    const int64_t c_max = list->ne[0] - 1;
+    GGML_ASSERT(c_max > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, c_max, mask->ne[1]);
+
+    result->op     = GGML_OP_Q4X_QSA_MASK_GATHER;
+    result->src[0] = mask;
+    result->src[1] = list;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_q4x_qsa_kv_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * rows,
+        struct ggml_tensor  * list) {
+    GGML_ASSERT(rows->type == GGML_TYPE_F16);
+    GGML_ASSERT(list->type == GGML_TYPE_I32);
+    GGML_ASSERT(rows->ne[2] == 1 && rows->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(list));
+    GGML_ASSERT(rows->nb[0] == sizeof(ggml_fp16_t));
+
+    const int64_t c_max = list->ne[0] - 1;
+    GGML_ASSERT(c_max > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, rows->ne[0], c_max);
+
+    result->op     = GGML_OP_Q4X_QSA_KV_GATHER;
+    result->src[0] = rows;
+    result->src[1] = list;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_q4x_hc_mix_collapse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * xn,
+        struct ggml_tensor  * up,
+        int32_t               hc) {
+    GGML_ASSERT(xn->type == GGML_TYPE_F32);
+    GGML_ASSERT(up->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(xn));
+    GGML_ASSERT(ggml_is_contiguous(up));
+    GGML_ASSERT(ggml_are_same_shape(xn, up));
+    GGML_ASSERT(xn->ne[2] == 1 && xn->ne[3] == 1);
+    GGML_ASSERT(hc > 0 && xn->ne[0] % hc == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, xn->ne[0]/hc, xn->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, hc);
+
+    result->op     = GGML_OP_Q4X_HC_MIX_COLLAPSE;
+    result->src[0] = xn;
+    result->src[1] = up;
 
     return result;
 }

@@ -8438,6 +8438,12 @@ static void ggml_compute_forward_top_k_f32(
 
     const int top_k = ne0;
 
+    // GGML_TOPK_LOG=1: log every CPU top_k dispatch (shape + this thread's wall time). The Vulkan
+    // backend rejects TOP_K with k >= 1024, so wide selections (e.g. QSA indexer widths) silently
+    // land here with a GPU sync + transfer per split -- this makes that visible.
+    static const bool topk_log = getenv("GGML_TOPK_LOG") != nullptr;
+    const int64_t t_log_us = (topk_log && ith == 0) ? ggml_time_us() : 0;
+
     int32_t * tmp = (int32_t *) params->wdata + (ne00 + CACHE_LINE_SIZE_F32) * ith;
 
     for (int64_t i = ith; i < nr; i += nth) {
@@ -8457,6 +8463,11 @@ static void ggml_compute_forward_top_k_f32(
         if (top_k > 1) {
             std::swap(dst_data[0], dst_data[1]);
         }
+    }
+
+    if (topk_log && ith == 0) {
+        fprintf(stderr, "[topk-cpu] n=%lld rows=%lld k=%d t=%.2fms\n",
+                (long long) ne00, (long long) nr, top_k, (ggml_time_us() - t_log_us)/1000.0);
     }
 }
 
@@ -11249,6 +11260,207 @@ void ggml_compute_forward_dsv4_hc_post(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_q4x_hc_combine
+
+static void ggml_compute_forward_q4x_hc_combine_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * residual  = dst->src[0];
+    const ggml_tensor * block_out = dst->src[1];
+    const ggml_tensor * inject    = dst->src[2];
+
+    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type    == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
+
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t hc       = residual->ne[1];
+    const int64_t n_tokens = residual->ne[2];
+
+    GGML_ASSERT(dst->ne[0] == n_embd);
+    GGML_ASSERT(dst->ne[1] == hc);
+    GGML_ASSERT(dst->ne[2] == n_tokens);
+    GGML_ASSERT(block_out->ne[0] == n_embd);
+    GGML_ASSERT(block_out->ne[1] == n_tokens);
+    GGML_ASSERT(inject->ne[0] == hc);
+    GGML_ASSERT(inject->ne[1] == n_tokens);
+
+    GGML_TENSOR_LOCALS(size_t, nbr, residual,  nb);
+    GGML_TENSOR_LOCALS(size_t, nbb, block_out, nb);
+    GGML_TENSOR_LOCALS(size_t, nbi, inject,    nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,       nb);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const float inv_hc = 1.0f / (float) hc;
+
+    const int64_t nr  = n_embd * hc * n_tokens;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i0 = ir % n_embd;
+        const int64_t ih = (ir / n_embd) % hc;
+        const int64_t it = ir / (n_embd * hc);
+
+        const float rv = *(const float *) ((const char *) residual->data  + i0*nbr0 + ih*nbr1 + it*nbr2);
+        const float bv = *(const float *) ((const char *) block_out->data + i0*nbb0 + it*nbb1);
+        const float iv = *(const float *) ((const char *) inject->data    + ih*nbi0 + it*nbi1);
+
+        const float w = 2.0f / (1.0f + expf(-iv * inv_hc));  // 2*sigmoid(iv / hc)
+
+        *(float *) ((char *) dst->data + i0*nbd0 + ih*nbd1 + it*nbd2) = rv + bv * w;
+    }
+}
+
+void ggml_compute_forward_q4x_hc_combine(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_q4x_hc_combine_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_q4x_qsa_union
+
+void ggml_compute_forward_q4x_qsa_union(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * top_k = dst->src[0];
+
+    const int32_t n_kv  = ggml_get_op_params_i32(dst, 0);
+    const int32_t c_max = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t n_sel = top_k->ne[0];
+    const int64_t nt    = top_k->ne[1];
+
+    std::vector<uint32_t> bitmap((n_kv + 31) / 32, 0);
+    for (int64_t t = 0; t < nt; ++t) {
+        const int32_t * row = (const int32_t *) ((const char *) top_k->data + t*top_k->nb[1]);
+        for (int64_t i = 0; i < n_sel; ++i) {
+            const int32_t v = row[i];
+            if (v >= 0 && v < n_kv) {
+                bitmap[v >> 5] |= 1u << (v & 31);
+            }
+        }
+    }
+    int32_t * out = (int32_t *) dst->data;
+    int32_t count = 0;
+    for (int32_t c = 0; c < n_kv; ++c) {
+        if (bitmap[c >> 5] & (1u << (c & 31))) {
+            if (count < c_max) {
+                out[count] = c;
+            }
+            count++;
+        }
+    }
+    for (int32_t i = count < c_max ? count : c_max; i < c_max; ++i) {
+        out[i] = 0;
+    }
+    out[c_max] = count;
+}
+
+// ggml_compute_forward_q4x_qsa_mask_gather
+
+void ggml_compute_forward_q4x_qsa_mask_gather(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * mask = dst->src[0];
+    const ggml_tensor * list = dst->src[1];
+
+    const int64_t c_max = dst->ne[0];
+    const int64_t nt    = dst->ne[1];
+    const int64_t n_kv  = mask->ne[0];
+
+    const int32_t * lst   = (const int32_t *) list->data;
+    const int32_t   count = lst[c_max];
+
+    for (int64_t t = 0; t < nt; ++t) {
+        const ggml_fp16_t * mrow = (const ggml_fp16_t *) ((const char *) mask->data + t*mask->nb[1]);
+        ggml_fp16_t * orow = (ggml_fp16_t *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t c = 0; c < c_max; ++c) {
+            if (c < count && lst[c] >= 0 && lst[c] < n_kv) {
+                orow[c] = mrow[lst[c]];
+            } else {
+                orow[c] = GGML_FP32_TO_FP16(-INFINITY);
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_q4x_qsa_kv_gather
+
+void ggml_compute_forward_q4x_qsa_kv_gather(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * rows = dst->src[0];
+    const ggml_tensor * list = dst->src[1];
+
+    const int64_t row_sz = dst->ne[0];
+    const int64_t c_max  = dst->ne[1];
+    const int64_t n_rows = rows->ne[1];
+
+    const int32_t * lst = (const int32_t *) list->data;
+
+    for (int64_t c = 0; c < c_max; ++c) {
+        const int32_t r = (lst[c] >= 0 && lst[c] < n_rows) ? lst[c] : 0;
+        const char * src = (const char *) rows->data + (size_t) r*rows->nb[1];
+        char * out = (char *) dst->data + (size_t) c*dst->nb[1];
+        memcpy(out, src, row_sz*sizeof(ggml_fp16_t));
+    }
+}
+
+// ggml_compute_forward_q4x_hc_mix_collapse
+
+void ggml_compute_forward_q4x_hc_mix_collapse(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * xn = dst->src[0];
+    const ggml_tensor * up = dst->src[1];
+
+    const int32_t hc = ggml_get_op_params_i32(dst, 0);
+    const int64_t E  = dst->ne[0];
+    const int64_t nt = dst->ne[1];
+
+    for (int64_t t = 0; t < nt; ++t) {
+        const float * xr = (const float *) ((const char *) xn->data + t*xn->nb[1]);
+        const float * ur = (const float *) ((const char *) up->data + t*up->nb[1]);
+        float * out = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t i = 0; i < E; ++i) {
+            float acc = 0.0f;
+            for (int32_t c = 0; c < hc; ++c) {
+                const float g = 1.0f / (1.0f + expf(-ur[c*E + i]));
+                acc += xr[c*E + i] * g;
+            }
+            out[i] = acc / (float) hc;
+        }
     }
 }
 
