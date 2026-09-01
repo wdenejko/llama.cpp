@@ -1451,6 +1451,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // Deep-context FA query-chunking lives in build_attn_mha (shared by this QSA dense path and
+    // the non-QSA build_attn path), so the single deep FLASH_ATTN_EXT dispatch cannot trip the
+    // amdgpu compute-ring watchdog. See llm_graph_context::build_attn_mha.
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 

@@ -2550,6 +2550,47 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                  int   il) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
+    // Deep-context FA query-chunking. With flash attention the whole batch of queries attends
+    // over n_kv keys in a SINGLE FLASH_ATTN_EXT dispatch; at wide batch (ub2048) and large n_kv
+    // that one GPU dispatch runs long enough to trip the amdgpu compute-ring watchdog (~10s) and
+    // the ring times out (observed ~233k of fill; ub1024 never trips as its dispatch is half the
+    // work). Queries are independent, so FA(Q[c],K,V,mask[c]) is exactly the c-th block of rows
+    // of FA(Q,K,V,mask): recurse over <=Q4X_FA_CHUNK-row query slices (each re-enters with the
+    // gate false, emitting one normal FA node -> its own submission -> under the watchdog) and
+    // concat. Gated on n_kv (k->ne[2]) and batch width (q->ne[2]) so shallow prefill and decode
+    // take the single dispatch untouched; single stream only. Q4X_FA_CHUNK_MIN_KV<=0 disables.
+    if (cparams.flash_attn && kq_b == nullptr && kq_mask != nullptr && k->ne[3] == 1) {
+        static const int64_t fa_chunk_min_kv = [] {
+            const char * e = getenv("Q4X_FA_CHUNK_MIN_KV");
+            return e ? (int64_t) atoll(e) : (int64_t) 163840;
+        }();
+        static const int64_t fa_chunk = [] {
+            const char * e = getenv("Q4X_FA_CHUNK");
+            const int64_t val = e ? (int64_t) atoll(e) : (int64_t) 1024;
+            return val >= 64 ? val : (int64_t) 1024;
+        }();
+        if (fa_chunk_min_kv > 0 && k->ne[2] >= fa_chunk_min_kv && q->ne[2] > fa_chunk) {
+            static bool fa_chunk_logged = false;
+            if (!fa_chunk_logged) {
+                fprintf(stderr, "qwen4exp: FA query-chunking engaged (n_kv=%lld n_tokens=%lld chunk=%lld)\n",
+                        (long long) k->ne[2], (long long) q->ne[2], (long long) fa_chunk);
+                fa_chunk_logged = true;
+            }
+            ggml_tensor * out = nullptr;
+            for (int64_t ts = 0; ts < q->ne[2]; ts += fa_chunk) {
+                const int64_t nt = std::min<int64_t>(fa_chunk, q->ne[2] - ts);
+                ggml_tensor * q_c = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], nt,
+                        q->nb[1], q->nb[2], ts * q->nb[2]);
+                ggml_tensor * m_c = ggml_view_4d(ctx0, kq_mask,
+                        kq_mask->ne[0], nt, kq_mask->ne[2], kq_mask->ne[3],
+                        kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3], ts * kq_mask->nb[1]);
+                ggml_tensor * o_c = build_attn_mha(q_c, k, v, kq_b, m_c, sinks, v_mla, kq_scale, il);
+                out = out ? ggml_concat(ctx0, out, o_c, 1) : o_c;
+            }
+            return out;
+        }
+    }
+
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
 

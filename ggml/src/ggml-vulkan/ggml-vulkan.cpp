@@ -2557,6 +2557,10 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    // Set per graph in graph_compute: serialize this graph's submissions (in-flight-1)
+    // because it is a deep, wide prefill graph that would otherwise trip the amdgpu
+    // compute-ring watchdog. See the depth gate in ggml_backend_vk_graph_compute.
+    bool serialize_deep {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
@@ -18184,7 +18188,7 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             memset(mset.dst, mset.val, mset.n);
         }
 
-        if (ctx->device->serialize_submissions) {
+        if (ctx->device->serialize_submissions || ctx->serialize_deep) {
             ggml_vk_submit(subctx, ctx->fence);
         } else if (almost_ready && !ctx->almost_ready_fence_pending) {
             ggml_vk_submit(subctx, ctx->almost_ready_fence);
@@ -18820,7 +18824,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
 
-        if (ctx->device->serialize_submissions) {
+        if (ctx->device->serialize_submissions || ctx->serialize_deep) {
             ggml_vk_submit(compute_ctx, ctx->fence);
             VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
             ctx->device->device.resetFences({ ctx->fence });
@@ -18831,7 +18835,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     }
 
     if (ctx->submit_pending) {
-        if (ctx->device->serialize_submissions) {
+        if (ctx->device->serialize_submissions || ctx->serialize_deep) {
             ctx->submit_pending = false;
         } else if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
             vk::TimelineSemaphoreSubmitInfo tl_info{
@@ -18850,7 +18854,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         } else {
             ctx->device->compute_queue->handle->submit({}, ctx->fence);
         }
-        if (!ctx->device->serialize_submissions) {
+        if (!(ctx->device->serialize_submissions || ctx->serialize_deep)) {
             ggml_vk_wait_for_fence(ctx);
         }
         ctx->submit_pending = false;
@@ -19692,6 +19696,33 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->do_add_rms_partials = false;
     ctx->do_add_rms_partials_offset_calculation = false;
 
+    // Depth-triggered submission serialization. The amdgpu compute-ring watchdog trips
+    // when many large submissions from a single deep prefill graph are queued in flight
+    // at once (the hazard scales with in-flight x KV depth): overlapped ub2048 walks fine
+    // until ~194k of fill, then the ring times out. Serializing submissions (in-flight-1)
+    // for just the deep, wide graphs removes the hazard while leaving shallow and decode
+    // graphs fully overlapped, so ub2048 keeps its shallow-prefill speed and still reaches
+    // full context. Gate on FLASH_ATTN_EXT K length (n_kv, src[1]->ne[1]) for depth and Q
+    // rows (query tokens, src[0]->ne[1]) for width, so decode at depth (a few queries)
+    // stays overlapped. Both thresholds are env-overridable; KV<=0 disables the gate.
+    {
+        static const int64_t ser_kv = getenv("GGML_VK_SERIALIZE_ABOVE_KV")
+                                       ? atoll(getenv("GGML_VK_SERIALIZE_ABOVE_KV")) : 163840;
+        static const int64_t ser_q  = getenv("GGML_VK_SERIALIZE_MIN_QUERIES")
+                                       ? atoll(getenv("GGML_VK_SERIALIZE_MIN_QUERIES")) : 32;
+        ctx->serialize_deep = false;
+        if (ser_kv > 0) {
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                const ggml_tensor * n = cgraph->nodes[i];
+                if (n->op == GGML_OP_FLASH_ATTN_EXT && n->src[0] && n->src[1] &&
+                    n->src[1]->ne[1] >= ser_kv && n->src[0]->ne[1] >= ser_q) {
+                    ctx->serialize_deep = true;
+                    break;
+                }
+            }
+        }
+    }
+
     int last_node = cgraph->n_nodes - 1;
 
     // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
@@ -19889,7 +19920,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             fprintf(stderr, "\n");
             fflush(stderr);
         }
-        if (ctx->device->serialize_submissions) {
+        if (ctx->device->serialize_submissions || ctx->serialize_deep) {
             try {
                 auto res = ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX);
                 if (res != vk::Result::eSuccess) {

@@ -47,10 +47,15 @@ if [ "${DEEPMTP:-1}" != "0" ]; then
     KV=q8_0
     echo "[run-flashnext] deep-ctx: CTX=$CTX > 131072 — KV=q8_0 frees ~3.9GB of host RAM (KV=f16 or DEEPMTP=0 overrides)" >&2
   fi
-  if [ -z "$UB_USER" ] && [ "$CTX" -gt 196608 ]; then
+  if [ -z "$UB_USER" ] && [ "$CTX" -gt 196608 ] && [ "$QUANT" != "IQ4_XS" ]; then
     UB=1024
-    echo "[run-flashnext] deep-ctx: CTX=$CTX > 196608 — UB=1024 so a full-depth fill survives (ub2048 host-OOMs at ~192k fill; UB=2048 to force, DEEPMTP=0 disables)" >&2
+    echo "[run-flashnext] deep-ctx: CTX=$CTX > 196608 — UB=1024 so a full-depth fill survives (ub2048 host-OOMs at ~192k fill on the larger quants; UB=2048 to force, DEEPMTP=0 disables)" >&2
   fi
+  # IQ4_XS keeps ub2048 to the full context: it is small enough to fit the host-RAM budget at
+  # ub2048, and the backend now survives deep ub2048 prefill (FA query-chunking splits the
+  # masked-dense attention so no single dispatch trips the amdgpu watchdog, and depth-triggered
+  # submission serialization removes the in-flight ring-residency hang). See qwen4exp.cpp
+  # (Q4X_FA_CHUNK*) and ggml-vulkan.cpp (GGML_VK_SERIALIZE_ABOVE_KV).
 fi
 PARALLEL="${PARALLEL:-1}"            # 1 = fastest per request
 UB="${UB:-2048}"                     # physical batch (512->2048 measured +14-25% pp)
@@ -95,7 +100,7 @@ VK_ENV=()
 [ "$COOPMAT" = "0" ] && VK_ENV=(GGML_VK_DISABLE_COOPMAT=1)
 # forward experiment env into the toolbox (toolbox run does not pass the host env)
 for _v in GGML_TOPK_LOG GGML_VK_EVENT_DEVICE_WAIT GGML_VK_EVENT_TL_OFF GGML_VK_DISABLE_FUSION GGML_VK_PERF_LOGGER GGML_VK_PERF_LOGGER_FREQUENCY GGML_VK_DENSE_F16B GGML_VK_DENSE_WAVE32 RADV_PERFTEST \
-             GGML_VK_MMID_INT GGML_VK_MMID_F16B GGML_VK_MMID_SCALE_EPILOGUE GGML_VK_MMID_PROBE GGML_VK_MMID_COMPACT GGML_VK_DENSE_THIN_BM GGML_VK_MMID_BN48 GGML_VK_MMID_BK64 GGML_VK_MM_TILE_EPILOG GGML_VK_DENSE_BM256 GGML_VK_MMV_RM_STDQ GGML_VK_MMV_RM_KQ Q4X_SPEC_STOCH_TOPK Q4X_SPEC_STOCH_TEMP Q4X_HC_MIX_NOFUSE GGML_VK_MMID_SMALLN GGML_VK_MMID_BM64 GGML_VK_MEMORY_LOGGER GGML_VK_JOB_BUDGET_MS GGML_VK_JOB_LOG GGML_VK_JOB_THROTTLE GGML_VK_SERIALIZE_SUBMISSIONS GGML_VK_SUBMIT_TRACE GGML_VK_MAX_NODES_PER_SUBMIT GGML_VK_MAX_MB_PER_SUBMIT; do
+             GGML_VK_MMID_INT GGML_VK_MMID_F16B GGML_VK_MMID_SCALE_EPILOGUE GGML_VK_MMID_PROBE GGML_VK_MMID_COMPACT GGML_VK_DENSE_THIN_BM GGML_VK_MMID_BN48 GGML_VK_MMID_BK64 GGML_VK_MM_TILE_EPILOG GGML_VK_DENSE_BM256 GGML_VK_MMV_RM_STDQ GGML_VK_MMV_RM_KQ Q4X_SPEC_STOCH_TOPK Q4X_SPEC_STOCH_TEMP Q4X_HC_MIX_NOFUSE GGML_VK_MMID_SMALLN GGML_VK_MMID_BM64 GGML_VK_MEMORY_LOGGER GGML_VK_JOB_BUDGET_MS GGML_VK_JOB_LOG GGML_VK_JOB_THROTTLE GGML_VK_SERIALIZE_SUBMISSIONS GGML_VK_SUBMIT_TRACE GGML_VK_MAX_NODES_PER_SUBMIT GGML_VK_MAX_MB_PER_SUBMIT GGML_VK_SERIALIZE_ABOVE_KV GGML_VK_SERIALIZE_MIN_QUERIES Q4X_FA_CHUNK_MIN_KV Q4X_FA_CHUNK; do
   if [ -n "${!_v:-}" ]; then VK_ENV+=("$_v=${!_v}"); fi
 done
 [ "${RSROLL:-1}" != "0" ]  && VK_ENV+=(Q4X_RS_ROLLBACK=1)     # partial recurrent rollback (+19% tg @temp1)
