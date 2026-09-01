@@ -19875,6 +19875,20 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
 
     auto const submit_after = [&](int start, int end) {
+        // [TAG_SUBMIT_TRACE] print each submission's op range as it is dispatched, flushed.
+        // With GGML_VK_SERIALIZE_SUBMISSIONS=1 each batch's fence is waited right below, so
+        // the LAST line printed before a ring-watchdog stall names the hanging submission.
+        static const bool submit_trace = getenv("GGML_VK_SUBMIT_TRACE") != nullptr;
+        if (submit_trace) {
+            uint64_t tf = 0;
+            for (int j = start; j <= end && j < cgraph->n_nodes; j++) tf += ggml_vk_get_node_flops(cgraph->nodes[j]);
+            fprintf(stderr, "[submit-trace] nodes %d..%d (%.1f GFLOP):", start, end, tf / 1e9);
+            for (int j = start; j <= end && j < cgraph->n_nodes && j < start + 48; j++) {
+                fprintf(stderr, " %s(%s)", cgraph->nodes[j]->name, ggml_op_name(cgraph->nodes[j]->op));
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+        }
         if (ctx->device->serialize_submissions) {
             try {
                 auto res = ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX);
