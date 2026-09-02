@@ -335,6 +335,7 @@
       <tr><td>Mat-vec rows-per-workgroup sweep</td><td class="r">flat</td><td>The decode GEMV already runs at ~89% of DRAM bandwidth. Launch shape can't add bytes.</td></tr>
       <tr><td>KV-cache quantization for speed</td><td class="r">wash</td><td>36 of 48 layers are recurrent and hold no KV, so q8_0 buys no throughput — but the same wash later became the deep-context <em>fit</em> lever: −3.9 GB of host RAM is what lets 262k boot with the fast batch tier.</td></tr>
       <tr><td>Micro-batch 3072, f16-B dense sweep, driver flags</td><td class="r">flat / −2%</td><td>Swept with engagement evidence; nothing reproduced.</td></tr>
+      <tr><td>Native FP4 quant (ROCmFP4-FAST) + its own FP4 MTP head</td><td class="r">no win</td><td>A ground-up FP4 build of this model (agentionai, via LaurentZuijdwijk's ROCmFPx tensor types, ported into the fork) decodes <b>49.5 t/s</b> on greedy code at <b>95% draft acceptance</b> — exactly where our IQ4_XS + MTP already sits. Decode is bandwidth-bound, so a different 4-bit encoding doesn't shrink the weight stream enough to matter, and the model's own FP4 MTP head only re-confirms the lever we already ship. The port loads and runs the full 87 GB per-head-PLE model, but buys nothing over the Q4 quants above.</td></tr>
     </table>
   </div>
 </section>
@@ -374,6 +375,7 @@
       <li><b>Unexpected output differences are bug reports.</b> Changes that should be bit-identical get compared byte-for-byte; when BK=64 "won" but outputs drifted, the drift was the bug. Quality gates are cloze needles at 32k/64k plus a 10-task code harness, run before any default flips.</li>
       <li><b>Boot-fit ≠ fill-fit.</b> On unified memory, KV pages acquire physical backing as context fills; a server that boots with gigabytes "free" can be OOM-killed twenty minutes into a deep prefill. Fill validation — an actual full-depth prefill — is part of every deep-context default now.</li>
       <li><b>Deep-context failures that look like model damage are often state accumulation.</b> A per-token FFN error too small to affect short outputs compounds through the recurrent layers over 32k tokens into retrieval collapse with perfectly coherent shallow behavior.</li>
+      <li><b>GPU-memory contention hides from the obvious counter.</b> This APU exposes only 2 GB of VRAM; a model lives entirely in GTT (<span class="knob">amdgpu.gttsize</span> ≈ 124 GB). A competing ROCm/HIP job allocates through KFD, which does <em>not</em> register in <span class="knob">mem_info_gtt_used</span> — so a <span class="knob">gtt=0</span> reading is not proof the box is clear. An 87 GB model that loads fine solo dies at load under contention with <span class="knob">radv: Not enough memory for command submission</span> → device-lost — a pin-budget failure, not host RAM. Clear the box (stop other GPU users, not just the systemd services) or offload before trusting a large-model boot.</li>
     </ul>
   </div>
 </section>
