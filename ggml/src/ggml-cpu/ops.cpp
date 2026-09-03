@@ -11445,7 +11445,8 @@ void ggml_compute_forward_q4x_hc_mix_collapse(
     const ggml_tensor * xn = dst->src[0];
     const ggml_tensor * up = dst->src[1];
 
-    const int32_t hc = ggml_get_op_params_i32(dst, 0);
+    const int32_t hc   = ggml_get_op_params_i32(dst, 0);
+    const int32_t perm = ggml_get_op_params_i32(dst, 1);   // 1: up rows are channel-major (i*hc + c)
     const int64_t E  = dst->ne[0];
     const int64_t nt = dst->ne[1];
 
@@ -11456,7 +11457,7 @@ void ggml_compute_forward_q4x_hc_mix_collapse(
         for (int64_t i = 0; i < E; ++i) {
             float acc = 0.0f;
             for (int32_t c = 0; c < hc; ++c) {
-                const float g = 1.0f / (1.0f + expf(-ur[c*E + i]));
+                const float g = 1.0f / (1.0f + expf(-ur[perm ? (i*hc + c) : (c*E + i)]));
                 acc += xr[c*E + i] * g;
             }
             out[i] = acc / (float) hc;

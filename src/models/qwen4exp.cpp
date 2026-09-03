@@ -25,6 +25,9 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
     ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
+    // [HC_COLLAPSE] set by the offline w_up row-permute: hc_*_up rows are channel-major, which
+    // lets the Vulkan mul_mm epilog fuse the mix collapse into the up-projection's store
+    ml.get_key(LLM_KV_HYPER_CONNECTION_UP_PERM,  hparams.hc_up_perm, false);
     GGML_ASSERT(hparams.dsv4_hc_mult > 0 && hparams.hc_low_rank > 0);
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
@@ -315,9 +318,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // Q4X_HC_MIX_NOFUSE=1 forces the primitive chain (A/B and correctness checks).
     static const bool q4x_mix_nofuse = getenv("Q4X_HC_MIX_NOFUSE") != nullptr;
 
+    // [HC_COLLAPSE] with the offline-permuted w_up (hparams.hc_up_perm) up_out's rows are
+    // channel-major, so only the perm-aware collapse op reads them correctly: force the fused
+    // op (the primitive chain below assumes stream-major rows). On Vulkan the backend then
+    // folds this op into the up-projection's mul_mm store and up_out is never materialized.
     ggml_tensor * mixed;
-    if (!q4x_mix_nofuse) {
-        mixed = ggml_q4x_hc_mix_collapse(ctx0, xn, up_out, (int32_t) hc);
+    if (!q4x_mix_nofuse || hparams.hc_up_perm != 0) {
+        mixed = ggml_q4x_hc_mix_collapse(ctx0, xn, up_out, (int32_t) hc, (int32_t) hparams.hc_up_perm);
         cb(mixed, "hc_mixed", il);
     } else {
         ggml_tensor * gate = ggml_sigmoid(ctx0, up_out);

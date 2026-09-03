@@ -296,6 +296,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,   "%s.hyper_connection.sinkhorn_iterations"   },
     { LLM_KV_HYPER_CONNECTION_EPSILON,               "%s.hyper_connection.epsilon"               },
     { LLM_KV_HYPER_CONNECTION_LOW_RANK,              "%s.hyper_connection.low_rank"              },
+    { LLM_KV_HYPER_CONNECTION_UP_PERM,               "%s.hyper_connection.up_perm"               },
 
     { LLM_KV_PLE_LAYERS,                             "%s.ple.layers"                             },
     { LLM_KV_PLE_NGRAM_SIZE,                         "%s.ple.ngram_size"                         },

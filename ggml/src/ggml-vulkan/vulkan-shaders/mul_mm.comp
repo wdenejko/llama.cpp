@@ -22,6 +22,8 @@
 #if defined(COOPMAT) || defined(MUL_MAT_ID_USE_SUBGROUPS)
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
+// [HC_COLLAPSE] lanes exchange gated values in f32 for the fused hc-stream mean
+#extension GL_KHR_shader_subgroup_shuffle : enable
 #endif
 
 #ifdef MUL_MAT_ID
@@ -115,10 +117,13 @@ layout (push_constant) uniform parameter
     uint broadcast2;
     uint broadcast3;
     uint padded_N;
-    // [MM_TILE_EPILOG] 0x1 = sigmoid, 0x2 = silu; scales apply before/after
+    // [MM_TILE_EPILOG] 0x1 = sigmoid, 0x2 = silu; scales apply before/after;
+    // 0x4 = trailing MUL by data_fmul; 0x8 = [HC_COLLAPSE] hc-stream mean into
+    // mixed[M/hc, N] (fuse_aux = hc, data_fmul = xn [M, N])
     uint fusion_flags;
     float fuse_scale_pre;
     float fuse_scale_post;
+    uint fuse_aux;
 #endif
 } p;
 
@@ -536,22 +541,46 @@ void main() {
             const bool is_in_bounds = dr + (cm_row + 1) * TM <= p.M && dc + (cm_col + 1) * TN <= p.N;
 
             // [MM_TILE_EPILOG] a fused trailing MUL needs per-element indices, so it
-            // routes through the staged paths below instead of the direct coopMatStore
-            const bool ep_mul = (p.fusion_flags & 4u) != 0u;
-            if (is_aligned && is_in_bounds && !ep_mul) {
+            // routes through the staged paths below instead of the direct coopMatStore.
+            // [HC_COLLAPSE] (0x8): w_up's output rows are pre-permuted offline so the hc
+            // stream-rows of a channel sit on hc consecutive lanes of one coopmat tile.
+            // Each lane gates its row (sigmoid already applied on the accumulators) by xn
+            // read at the un-permuted index, the lanes exchange the gated values by
+            // subgroup shuffle (f32, no stage round-trip), and the lane owning row%hc==0
+            // sums them in ascending-c order (bit-exact vs the standalone collapse) and
+            // writes mixed[row/hc, t]. stride_d is M/hc and batch is 1 by construction.
+            // Shuffles run unconditionally so the subgroup stays convergent.
+            const bool ep_mul      = (p.fusion_flags & 4u) != 0u;
+            const bool ep_collapse = (p.fusion_flags & 8u) != 0u;
+            const uint hc_n        = ep_collapse ? p.fuse_aux : 1u;
+            const uint hc_E        = p.M / hc_n;
+            if (is_aligned && is_in_bounds && !ep_mul && !ep_collapse) {
                 // Full coopMat is within bounds and stride_d is aligned with 16B
                 coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> cm_dtype = coopmat<D_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(sums[cm_col * cms_per_row + cm_row]);
                 coopMatStore(cm_dtype, data_d, offsets + (dc + cm_col * TN) * p.stride_d + dr + cm_row * TM, p.stride_d, gl_CooperativeMatrixLayoutColumnMajor);
             } else if (is_in_bounds) {
-                // Full coopMat is within bounds (staged: unaligned stride or fused MUL)
+                // Full coopMat is within bounds (staged: unaligned stride, fused MUL or collapse)
                 coopMatStore(sums[cm_col * cms_per_row + cm_row], coopmat_stage, warp_i * TM * TN, TM, gl_CooperativeMatrixLayoutColumnMajor);
 
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
-                    const uint didx = offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r;
+                    const uint grow = dr + cm_row * TM + store_r;
+                    const uint tcol = dc + cm_col * TN + col + store_c;
                     float sv = float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
-                    if (ep_mul) { sv *= data_fmul[didx]; }
-                    data_d[didx] = D_TYPE(sv);
+                    if (ep_collapse) {
+                        const float g = sv * data_fmul[tcol * p.M + (grow % hc_n) * hc_E + grow / hc_n];
+                        float acc = 0.0f;
+                        for (uint c = 0; c < hc_n; ++c) {
+                            acc += subgroupShuffle(g, min(gl_SubgroupInvocationID + c, gl_SubgroupSize - 1u));
+                        }
+                        if (store_r % hc_n == 0u) {
+                            data_d[offsets + tcol * p.stride_d + grow / hc_n] = D_TYPE(acc / float(hc_n));
+                        }
+                    } else {
+                        const uint didx = offsets + tcol * p.stride_d + grow;
+                        if (ep_mul) { sv *= data_fmul[didx]; }
+                        data_d[didx] = D_TYPE(sv);
+                    }
                 }
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
             } else if (dr + cm_row * TM < p.M && dc + cm_col * TN < p.N) {
@@ -560,9 +589,21 @@ void main() {
 
                 controlBarrier(gl_ScopeSubgroup, gl_ScopeSubgroup, gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
                 [[unroll]] for (uint col = 0; col < TN; col += storestride) {
-                    if (dr + cm_row * TM + store_r < p.M && dc + cm_col * TN + col + store_c < p.N) {
-                        const uint didx = offsets + (dc + cm_col * TN + col + store_c) * p.stride_d + dr + cm_row * TM + store_r;
-                        float sv = float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    const uint grow = dr + cm_row * TM + store_r;
+                    const uint tcol = dc + cm_col * TN + col + store_c;
+                    const bool ok   = grow < p.M && tcol < p.N;
+                    float sv = float(coopmat_stage[warp_i * TM * TN + (col + store_c) * TM + store_r]);
+                    if (ep_collapse) {
+                        const float g = ok ? sv * data_fmul[tcol * p.M + (grow % hc_n) * hc_E + grow / hc_n] : 0.0f;
+                        float acc = 0.0f;
+                        for (uint c = 0; c < hc_n; ++c) {
+                            acc += subgroupShuffle(g, min(gl_SubgroupInvocationID + c, gl_SubgroupSize - 1u));
+                        }
+                        if (ok && store_r % hc_n == 0u) {
+                            data_d[offsets + tcol * p.stride_d + grow / hc_n] = D_TYPE(acc / float(hc_n));
+                        }
+                    } else if (ok) {
+                        const uint didx = offsets + tcol * p.stride_d + grow;
                         if (ep_mul) { sv *= data_fmul[didx]; }
                         data_d[didx] = D_TYPE(sv);
                     }
