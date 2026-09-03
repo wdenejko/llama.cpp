@@ -6,7 +6,7 @@ set -u
 log() { echo "[$(basename "$0")] $*" >&2; }
 TOOLBOX=llama-vulkan-wdenejko
 BIN=/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin
-MODEL=/home/wdenejko/models/Qwen3.8-Flash-Next-Uncensored-GGUF/IQ4_XS/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf
+MODEL=/home/wdenejko/models/Qwen3.8-Flash-Next-Uncensored-GGUF/IQ4_XS-a1inject/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf   # A1: 96 hc_*_inject weights upcast IQ4_XS->F16 so the fast GEMV inject path fires (+3.2% pp d0, lossless). Pre-A1 dir kept at IQ4_XS/.
 DRAFT=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M-hcfix.gguf   # Q4 MTP head: with the PLE in RAM the Q8 head host-OOMs past ~129k
 CTX=262144
 UB=1024
