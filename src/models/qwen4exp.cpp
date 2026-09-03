@@ -296,8 +296,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+    // A2: multiply by the per-(channel,stream) gamma BEFORE flattening, so RMS_NORM and MUL stay
+    // adjacent and the Vulkan RMS_NORM_MUL fusion fires (the reshape between them blocked it).
+    // w_norm is [hc_dim] laid out n_embd-fastest == [n_embd, hc]; the fused rms_norm shader indexes
+    // src1 as src1_idx(0,row,channel,samp)+col, so [n_embd, hc, 1] broadcasts over the token axis.
+    xn = ggml_mul(ctx0, xn, ggml_reshape_3d(ctx0, w_norm, n_embd, hc, 1));
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
@@ -1846,7 +1850,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     // cont the transposed activations before the concat: concat's non-contiguous path costs
     // ~13ms per GDN layer on 2048-token prefill chunks (~463ms per chunk over 36 layers,
     // measured on gfx1151 by the apepojken fork - +8% prefill at every depth from this line)
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_cont(ctx0, ggml_transpose(ctx0, x)), 0);
+    // A3 (measured +4.2% pp d0, byte-exact): the transposed-concat kernel subsumes the explicit
+    // cont, which the stale comment above credited with +8% before that kernel existed. Default now
+    // DROPS the cont; Q4X_A3_KEEP_CONT=1 restores it (regression fallback).
+    ggml_tensor * xt = ggml_transpose(ctx0, x);
+    { static const bool a3_keep_cont = getenv("Q4X_A3_KEEP_CONT") != nullptr; if (a3_keep_cont) xt = ggml_cont(ctx0, xt); }
+    ggml_tensor * conv_input = ggml_concat(ctx0, state, xt, 0);
 
     // keep the last state_cols columns for the next ubatch
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
