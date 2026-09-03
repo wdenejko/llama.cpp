@@ -6,7 +6,7 @@ set -u
 log() { echo "[$(basename "$0")] $*" >&2; }
 TOOLBOX=llama-vulkan-wdenejko
 BIN=/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin
-MODEL=/home/wdenejko/models/Qwen3.8-Flash-Next-Uncensored-GGUF/IQ4_XS-a1inject/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf   # A1: 96 hc_*_inject weights upcast IQ4_XS->F16 so the fast GEMV inject path fires (+3.2% pp d0, lossless). Pre-A1 dir kept at IQ4_XS/.
+MODEL=/home/wdenejko/models/Qwen3.8-Flash-Next-Uncensored-GGUF/IQ4_XS-a1perm/Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf   # K1: the A1 model with the 97 hc_*_up rows permuted channel-major + KV hyper_connection.up_perm=1 so the fused HC collapse epilog engages (+3.6% pp d0 on top of A1, lossless). Fallbacks: IQ4_XS-a1inject/ (A1 only), IQ4_XS/ (pre-A1).
 DRAFT=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M-hcfix.gguf   # Q4 MTP head: with the PLE in RAM the Q8 head host-OOMs past ~129k
 CTX=196608
 UB=2048
@@ -14,6 +14,8 @@ PORT=8080
 NEED_FREE_GB=100   # clean-box gate (a drained box shows ~118G free); a cleanliness check, not a fit predictor
 TPL="$(cd "$(dirname "$0")" && pwd)/uncensored-chat-template.jinja"   # Uncensored template relaxed to accept mid-conversation system messages (agent harnesses)
 [ -f "$TPL" ] || { log "template missing: $TPL"; exit 1; }
+# the row-permuted model is only correct on a binary that reads hyper_connection.up_perm; an older build would silently misread it
+grep -qa "hyper_connection.up_perm" "$BIN/libllama.so" 2>/dev/null || { log "ABORT: $BIN lacks hc up_perm support — it would misread the row-permuted a1perm model (serve IQ4_XS-a1inject/ with that binary instead)"; exit 1; }
 # --- box safety (every measured wedge trigger): one server at a time; boot only into a drained, clean box ---
 if pgrep -f "alias flashnext" >/dev/null; then log "a flashnext llama-server is already running — stop it first"; exit 1; fi
 log "stopping comfyui + OCR for the duration"
