@@ -11038,6 +11038,10 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
                     ctx->fused_mm_tile_aux = (uint32_t) ggml_get_op_params_i32(n, 0);
                     flags |= MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_COLLAPSE;
                     unary_seen = true;
+                    static const bool dbg_walk = getenv("GGML_VK_HC_COLLAPSE_DEBUG") != nullptr;
+                    if (dbg_walk) {
+                        fprintf(stderr, "[hc_collapse] walker FUSE node %d -> %s\n", node_idx, n->name);
+                    }
                 } else {
                     GGML_ASSERT(n->op == GGML_OP_UNARY);
                     flags |= ggml_get_unary_op(n) == GGML_UNARY_OP_SIGMOID ? MM_TILE_FUSION_SIGMOID
@@ -15066,6 +15070,11 @@ static void ggml_vk_q4x_hc_mix_collapse(ggml_backend_vk_context * ctx, vk_contex
     const uint32_t E  = (uint32_t) dst->ne[0];
     const uint32_t nt = (uint32_t) dst->ne[1];
 
+    static const bool dbg_sa = getenv("GGML_VK_HC_COLLAPSE_DEBUG") != nullptr;
+    if (dbg_sa) {
+        fprintf(stderr, "[hc_collapse] STANDALONE %s perm=%d nt=%u\n", dst->name, ggml_get_op_params_i32(dst, 1), nt);
+    }
+
     const vk_op_q4x_hc_mix_collapse_push_constants pc = {
         E, (uint32_t) ggml_get_op_params_i32(dst, 0), E * nt,
         (uint32_t) (xn->nb[1] / sizeof(float)),
@@ -19002,30 +19011,38 @@ static bool ggml_vk_can_fuse_mm_tile_epilog(const ggml_backend_vk_context * ctx,
     // (the hc stream-rows of a channel must share one coopmat tile). ggml_can_fuse can't
     // be used here: it insists on same-shape chain nodes and mixed is M/hc tall.
     if (num_extra == 1 && cgraph->nodes[node_idx + 1]->op == GGML_OP_Q4X_HC_MIX_COLLAPSE) {
+        static const bool dbg = getenv("GGML_VK_HC_COLLAPSE_DEBUG") != nullptr;
         const ggml_tensor * cl = cgraph->nodes[node_idx + 1];
         const ggml_tensor * xn = cl->src[0];
         const int32_t hc   = ggml_get_op_params_i32(cl, 0);
         const int32_t perm = ggml_get_op_params_i32(cl, 1);
+        const char * why = nullptr;
         if (perm != 1 || hc <= 0 || cl->src[1] != mm || cl->type != GGML_TYPE_F32) {
-            return false;
+            why = "perm/hc/src1/type";
+        } else if ((cl->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            why = "collapse lacks COMPUTE flag";
+        } else if (!ggml_node_has_n_uses(cgraph, node_idx, 1)) {
+            why = "mm not single-use";
+        } else if (mm->ne[2] != 1 || mm->ne[3] != 1 || mm->ne[0] % hc != 0) {
+            why = "batch/M";
+        } else if (cl->ne[0] != mm->ne[0] / hc || cl->ne[1] != mm->ne[1]) {
+            why = "dst shape";
+        } else if (xn->type != GGML_TYPE_F32 || !ggml_are_same_shape(xn, mm)) {
+            why = "xn type/shape";
+        } else if (!ggml_is_contiguous(xn)) {
+            why = "xn not contiguous";
+        } else if (get_misalign_bytes(ctx, xn) != 0) {
+            why = "xn misaligned";
+        } else if (!ctx->device->coopmat_support || ctx->device->coopmat_m % (uint32_t) hc != 0) {
+            why = "device tiles";
         }
-        if ((cl->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_node_has_n_uses(cgraph, node_idx, 1)) {
-            return false;
+        if (dbg) {
+            fprintf(stderr, "[hc_collapse] matcher node %d %s%s%s  mm=%s xn=%s(view_src=%s off=%zu) cl=%s uses(mm)=%d\n",
+                    node_idx, why ? "REJECT: " : "ACCEPT", why ? why : "", "",
+                    mm->name, xn->name, xn->view_src ? xn->view_src->name : "-", (size_t) xn->view_offs,
+                    cl->name, (int) ggml_node_get_use_count(cgraph, node_idx));
         }
-        if (mm->ne[2] != 1 || mm->ne[3] != 1 || mm->ne[0] % hc != 0) {
-            return false;
-        }
-        if (cl->ne[0] != mm->ne[0] / hc || cl->ne[1] != mm->ne[1]) {
-            return false;
-        }
-        if (xn->type != GGML_TYPE_F32 || !ggml_are_same_shape(xn, mm) || !ggml_is_contiguous(xn) ||
-            get_misalign_bytes(ctx, xn) != 0) {
-            return false;
-        }
-        if (!ctx->device->coopmat_support || ctx->device->coopmat_m % (uint32_t) hc != 0) {
-            return false;
-        }
-        return true;
+        return why == nullptr;
     }
 
     enum ggml_op ops[5];
@@ -19899,7 +19916,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MM_TILE_EPILOG";
                 op_srcs_fused_elementwise[0] = false;
-                op_srcs_fused_elementwise[1] = true;
+                // the HC collapse reads xn [M,N] but writes mixed [M/hc,N]: not elementwise
+                op_srcs_fused_elementwise[1] = cgraph->nodes[i + 1]->op != GGML_OP_Q4X_HC_MIX_COLLAPSE;
             } else if (ggml_vk_can_fuse_mmv_epilog(ctx, cgraph, i, 3)) {
                 ctx->num_additional_fused_ops = 3;
                 fusion_string = "MUL_MAT_EPILOG";
@@ -20097,6 +20115,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                 }
                                 if (!found) {
                                     need_disable = true;
+                                    static const bool dbg_ov = getenv("GGML_VK_HC_COLLAPSE_DEBUG") != nullptr;
+                                    if (dbg_ov && ctx->num_additional_fused_ops == 1 &&
+                                        cgraph->nodes[i + 1]->op == GGML_OP_Q4X_HC_MIX_COLLAPSE) {
+                                        fprintf(stderr, "[hc_collapse] DISABLE node %d: src %s (k=%d s=%u) overlaps dst %s\n",
+                                                i, src->name, k, s, dst->name);
+                                    }
                                 }
                             }
                         }
@@ -20108,6 +20132,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
+                // the node runs unfused: don't let the perf logger label it with the fusion
+                fusion_string = nullptr;
             }
         }
 
@@ -20341,7 +20367,10 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                    (a->op == GGML_OP_MUL_MAT    && b->op == GGML_OP_MUL)    ||
                    (a->op == GGML_OP_SCALE      && b->op == GGML_OP_UNARY)  ||
                    (a->op == GGML_OP_UNARY      && b->op == GGML_OP_SCALE)  ||
-                   (a->op == GGML_OP_UNARY      && b->op == GGML_OP_MUL);
+                   (a->op == GGML_OP_UNARY      && b->op == GGML_OP_MUL)    ||
+                   // qwen4exp HC up-projection + stream collapse (mm tile epilog, see
+                   // ggml_vk_can_fuse_mm_tile_epilog): must stay adjacent or the fusion is lost
+                   (a->op == GGML_OP_MUL_MAT    && b->op == GGML_OP_Q4X_HC_MIX_COLLAPSE);
         };
 
         const int NUM_TO_CHECK = 20;

@@ -324,7 +324,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // folds this op into the up-projection's mul_mm store and up_out is never materialized.
     ggml_tensor * mixed;
     if (!q4x_mix_nofuse || hparams.hc_up_perm != 0) {
-        mixed = ggml_q4x_hc_mix_collapse(ctx0, xn, up_out, (int32_t) hc, (int32_t) hparams.hc_up_perm);
+        // lo rides along as the keep-alive src so the allocator cannot hand its (dead) slot to
+        // mixed: the fused epilog writes mixed while the up GEMM's other workgroups still read lo,
+        // and the backend refuses that overlap by dropping the fusion for the layer.
+        mixed = ggml_q4x_hc_mix_collapse(ctx0, xn, up_out, (int32_t) hc, (int32_t) hparams.hc_up_perm, lo);
         cb(mixed, "hc_mixed", il);
     } else {
         ggml_tensor * gate = ggml_sigmoid(ctx0, up_out);
