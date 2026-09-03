@@ -1403,7 +1403,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
-            if (!props.caps.mmap_support) {
+            // GPU tensors load via the async pinned-buffer upload path (file I/O), not the
+            // mmap zero-copy path, so a GPU that lacks buffer_from_host_ptr must NOT force
+            // mmap off globally. Only host/CPU tensors use the mmap zero-copy path and the
+            // CPU backend always supports it. Keeping mmap on lets a CPU --override-tensor
+            // offload (per_layer_token_embd, flagged TENSOR_READ_LAZY) stay file-backed /
+            // on-demand / evictable instead of a large anonymous copy, while GPU weights keep
+            // the fast async load. (gfx1151 iGPU reports mmap_support=false only for the old
+            // load-all-tensors-via-mmap speed reason, which no longer applies to GPU here.)
+            // NB: an integrated GPU is typed _IGPU (ggml-vulkan.cpp), not _GPU, so exclude both.
+            if (!props.caps.mmap_support &&
+                props.type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                props.type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 ml.use_mmap = false;
                 break;
             }
