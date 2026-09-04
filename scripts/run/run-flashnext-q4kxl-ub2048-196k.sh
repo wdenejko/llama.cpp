@@ -6,12 +6,14 @@ set -u
 log() { echo "[$(basename "$0")] $*" >&2; }
 TOOLBOX=llama-vulkan-wdenejko
 BIN=/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin
-MODEL=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+MODEL=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL-a1perm/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf   # K1: base UD-Q4_K_XL with the 97 hc_*_up rows permuted channel-major + KV hyper_connection.up_perm=1 so the fused HC collapse epilog engages on the Q8_0 up-weights (+4.0% pp d0, lossless/greedy-identical). Fallback: UD-Q4_K_XL/ (base; already carries A1 F32-inject + correct D1 compress_ratios, no K1).
 DRAFT=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M-hcfix.gguf   # Q4 MTP head: with the PLE in RAM the Q8 head host-OOMs past ~129k
 CTX=196608
 UB=2048
 PORT=8080
 NEED_FREE_GB=100   # clean-box gate (a drained box shows ~118G free); a cleanliness check, not a fit predictor
+# the row-permuted a1perm model is only correct on a binary that reads hyper_connection.up_perm; an older build would silently misread the permuted rows
+grep -qa "hyper_connection.up_perm" "$BIN/libllama.so" 2>/dev/null || { log "ABORT: $BIN lacks hc up_perm support — it would misread the row-permuted a1perm model (serve UD-Q4_K_XL/ with that binary instead)"; exit 1; }
 # --- box safety (every measured wedge trigger): one server at a time; boot only into a drained, clean box ---
 if pgrep -f "alias flashnext" >/dev/null; then log "a flashnext llama-server is already running — stop it first"; exit 1; fi
 log "stopping comfyui + OCR for the duration"
@@ -41,7 +43,7 @@ log "memory ready: gtt=$(_gtt)G free=$(_free)G"
 podman restart "$TOOLBOX" >/dev/null 2>&1 || podman start "$TOOLBOX" >/dev/null 2>&1 || true   # fresh container: clean state for coopmat MTP graph init
 sleep 2
 
-log "UD-Q4_K_XL (Unsloth base) ub=$UB ctx=$CTX load-mode=none kv=q8_0 mtp=Q4-draft(n4,pmin0.75) temp=1.0 reasoning=medium port=$PORT"
+log "UD-Q4_K_XL-a1perm (Unsloth base + K1 row-permute) ub=$UB ctx=$CTX load-mode=none kv=q8_0 mtp=Q4-draft(n4,pmin0.75) temp=1.0 reasoning=medium port=$PORT"
 # not exec — the shell must survive to run the trap
 toolbox run --container "$TOOLBOX" env Q4X_RS_ROLLBACK=1 Q4X_QSA_BLK_TOPK=1 Q4X_QSA_GP=28672 Q4X_SPEC_STOCH=1 LD_LIBRARY_PATH="$BIN" \
   "$BIN/llama-server" -m "$MODEL" --load-mode none \
