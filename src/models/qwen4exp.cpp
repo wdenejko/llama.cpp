@@ -470,9 +470,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(e_norm, "mtp_enorm", il);
 
     // fc_embedding(e) + fc_hidden(h) is one projection of the concatenation; the converter
-    // merges the two checkpoint tensors into this single eh_proj
-    ggml_tensor * inpL = build_lora_mm(layer.nextn.eh_proj,
-            ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+    // merges the two checkpoint tensors into this single eh_proj.
+    // Fold the hc streams into the column dimension so the projection is ONE GEMM with
+    // n = hc*n_tokens. As a [2*n_embd, hc, n_tokens] operand the backends treat n_tokens as a
+    // batch of mat-vecs with n = hc and re-read the weight once per token: measured 44 ms per
+    // 512-token draft ubatch on gfx1151, 58% of the draft's prefill GPU time and ~4.5% of the
+    // served prefill. Every output column is the same dot product either way; eh_proj_s is a
+    // scalar, so it broadcasts over the 2D result just as it did over the 3D one.
+    ggml_tensor * eh_in = ggml_concat(ctx0, e_norm, h_norm, 0);   // [2*n_embd, hc, n_tokens], contiguous
+    eh_in = ggml_reshape_2d(ctx0, eh_in, 2*n_embd, hc*n_tokens);
+    ggml_tensor * inpL = build_lora_mm(layer.nextn.eh_proj, eh_in, layer.nextn.eh_proj_s);
+    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_tokens);
     cb(inpL, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
