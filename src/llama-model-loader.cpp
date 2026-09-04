@@ -1670,6 +1670,12 @@ bool llama_model_loader::load_all_data(
                         ++buffer_idx;
                         buffer_idx %= n_buffers;
                     }
+                    if (use_mmap && weight->idx < mappings.size() && mappings.at(weight->idx)) {
+                        // the pages just streamed through the fd are now on the device: evict them so the
+                        // page cache keeps room for the mapping-resident host tensors (and a warm re-boot
+                        // does not start out under memory pressure)
+                        mappings.at(weight->idx)->drop_page_cache(read_start, read_end);
+                    }
                 } else {
                     read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
@@ -1719,6 +1725,24 @@ bool llama_model_loader::load_all_data(
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
+            }
+            // fault the mapping-resident (lazy) host tensors in now that the device uploads are done
+            // and their pages evicted: a PLE that is paged in row by row on first use halves prefill
+            // (measured); populated last, its pages are also the freshest in the page cache
+            if (!lazy_tensor_ranges.empty()) {
+                const int64_t t_populate = ggml_time_us();
+                size_t n_populated = 0;
+                for (const auto & kv : lazy_tensor_ranges) {
+                    if (kv.first >= mappings.size() || !mappings.at(kv.first)) {
+                        continue;
+                    }
+                    for (const auto & r : kv.second) {
+                        mappings.at(kv.first)->populate(r.first, r.second);
+                        n_populated += r.second - r.first;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: populated %.2f GiB of mapping-resident tensors in %.1f s\n", __func__,
+                        n_populated / (1024.0 * 1024.0 * 1024.0), (ggml_time_us() - t_populate) / 1e6);
             }
         }
         if (progress_callback) {

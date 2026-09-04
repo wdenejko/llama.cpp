@@ -467,9 +467,14 @@ struct llama_mmap::impl {
 
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         size = file->size();
-        int fd = file->file_id();
+        fd = file->file_id();
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
+        // With lazy (mapping-resident host) ranges the rest of the file is streamed to the device
+        // through the fd by the loader, which evicts each tensor's pages as it goes: a whole-file
+        // readahead here would only flood the page cache ahead of it (measured: it halved prefill
+        // by starving the never-populated PLE). Populate the lazy ranges after loading instead.
+        if (!lazy_ranges.empty()) { prefetch = 0; }
 #ifdef __linux__
         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
@@ -562,6 +567,53 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    void populate(size_t first, size_t last) {
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        first = first & ~(page_size - 1);
+        last  = std::min((last + page_size - 1) & ~(page_size - 1), size);
+        if (first >= last) {
+            return;
+        }
+        char * p = (char *) addr + first;
+        const size_t len = last - first;
+#ifdef __linux__
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22   // Linux 5.14+
+#endif
+        if (madvise(p, len, MADV_POPULATE_READ) == 0) {
+            return;
+        }
+        LLAMA_LOG_DEBUG("madvise(MADV_POPULATE_READ) failed (%s), touching pages instead\n", strerror(errno));
+#endif
+        // older kernels / other platforms: hint readahead, then touch one byte per page
+        if (posix_madvise(p, len, POSIX_MADV_WILLNEED)) {
+            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n", strerror(errno));
+        }
+        volatile char sink = 0;
+        for (size_t off = 0; off < len; off += page_size) {
+            sink = (char) (sink + ((volatile const char *) p)[off]);
+        }
+        (void) sink;
+    }
+
+    void drop_page_cache(size_t first, size_t last) {
+        // only whole pages strictly inside the range: a boundary page may be shared with a
+        // neighbouring mapping-resident tensor
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        first = (first + page_size - 1) & ~(page_size - 1);
+        last  = std::min(last & ~(page_size - 1), size);
+        if (first >= last) {
+            return;
+        }
+#ifdef __linux__
+        // the loader streams device-bound tensors through the fd, not through this mapping, so
+        // those pages carry no PTEs here and POSIX_FADV_DONTNEED evicts them from the page cache
+        if (posix_fadvise(fd, (off_t) first, (off_t) (last - first), POSIX_FADV_DONTNEED)) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(errno));
+        }
+#endif
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -569,6 +621,8 @@ struct llama_mmap::impl {
             }
         }
     }
+
+    int fd = -1;
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
@@ -626,6 +680,16 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void populate(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
+    void drop_page_cache(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -656,6 +720,16 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    void populate(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
+    void drop_page_cache(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
 #endif
 
     void * addr;
@@ -670,6 +744,8 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+void llama_mmap::populate(size_t first, size_t last) { pimpl->populate(first, last); }
+void llama_mmap::drop_page_cache(size_t first, size_t last) { pimpl->drop_page_cache(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
