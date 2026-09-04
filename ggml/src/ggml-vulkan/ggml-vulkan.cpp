@@ -4642,6 +4642,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
 
+            // EXPERIMENT (GGML_VK_DENSE_L_BK=32|64): deeper K block for the dense f16 large tile.
+            // The qwen4exp HC down GEMM (m=320 k=10240) runs 640 BK=16 iterations per workgroup
+            // and sits at ~7.4 TFLOPS while split-K (more WGs) only makes it slower, i.e. the
+            // per-iteration load->LDS->barrier->MMA chain is the wall; halving/quartering the
+            // iteration count is the cheapest probe. Applies to every dense f16-path large GEMM.
+            {
+                static const char * l_bk_env = getenv("GGML_VK_DENSE_L_BK");
+                const int l_bk = l_bk_env ? atoi(l_bk_env) : 0;
+                if (l_bk == 32 || l_bk == 64) {
+                    l_warptile[3] = (uint32_t) l_bk;
+                    fprintf(stderr, "ggml_vulkan: dense large tile BK=%d (GGML_VK_DENSE_L_BK)\n", l_bk);
+                }
+            }
+
             // EXPERIMENT (GGML_VK_DENSE_BM256=1): 256-tall dense large tile. The HC
             // low-rank pair (m=320 k=10240 n=2048) re-streams its 40MB B matrix once
             // per M-tile; BM 128->256 cuts that from 3 passes to 2. Warp grids keep
@@ -10211,9 +10225,12 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     ctx->fused_mm_tile_mul = nullptr;
     ctx->fused_mm_tile_aux = 0;
 
-    // a scale/unary-only epilog can move into the split_k reduce pass; MUL-by-tensor and the HC
-    // collapse index the D tile in the store and still require split_k == 1
-    const bool mm_fusion_blocks_split_k = (mm_fusion_flags & ~(MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU)) != 0;
+    // a scale/unary-only epilog can move into the split_k reduce pass (only when the skinny-M
+    // split-K experiment is enabled, so the stock heuristic never starts splitting fused GEMMs);
+    // MUL-by-tensor and the HC collapse index the D tile in the store and always need split_k == 1
+    static const bool skinny_splitk_on = getenv("Q4X_SKINNY_SPLITK") && atoi(getenv("Q4X_SKINNY_SPLITK")) > 1;
+    const bool mm_fusion_blocks_split_k = mm_fusion_flags != 0 &&
+        (!skinny_splitk_on || (mm_fusion_flags & ~(MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU)) != 0);
     const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || mm_fusion_blocks_split_k, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
