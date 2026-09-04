@@ -1319,6 +1319,16 @@ struct vk_mat_mat_push_constants {
 // mixed [M/hc, N] directly so the [M, N] up_out is never materialized
 #define MM_TILE_FUSION_COLLAPSE 0x8
 
+// split_k reduce: sums the k_num partial products and, when a scale/unary mm tile epilog was
+// fused into a split_k matmul, applies it here (mul_mm cannot apply it to partial sums)
+struct vk_split_k_reduce_push_constants {
+    uint32_t ne;
+    uint32_t k_num;
+    uint32_t fusion_flags;   // MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU only
+    float    scale_pre;
+    float    scale_post;
+};
+
 #define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
@@ -6186,7 +6196,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_NVFP4],   "get_rows_nvfp4_f32",   get_rows_nvfp4_f32_len,   get_rows_nvfp4_f32_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_back_f32, "get_rows_back_f32", get_rows_back_f32_len, get_rows_back_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1, true);
 
-    ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, sizeof(vk_split_k_reduce_push_constants), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
 
     for (auto &it : device->pipeline_fa_mask_opt) {
@@ -9603,6 +9613,34 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
         }
     }
 
+    // [Q4X_SKINNY_SPLITK] skinny-M long-K GEMMs (the qwen4exp HC low-rank down projection,
+    // m=320 k=10240 n=2048) tile to 48 large-tile workgroups on 40 CUs: too many for the
+    // heuristic above to split, far too few to occupy the device (measured ~7.4 TFLOPS vs ~17
+    // for the same tile on m=2560; the medium tile is worse still, 4.2). Split K so the grid
+    // fills the GPU; a fused scale/unary epilog then runs in the split_k reduce pass.
+    // Q4X_SKINNY_SPLITK=<n> (0/unset = off) is the A/B knob.
+    static const int skinny_split = getenv("Q4X_SKINNY_SPLITK") ? atoi(getenv("Q4X_SKINNY_SPLITK")) : 0;
+    if (split_k == 1 && skinny_split > 1 && ctx->device->shader_core_count != 0 &&
+        m >= pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1] && k >= 8192) {
+        const uint32_t tiles = CEIL_DIV(m, pipeline->wg_denoms[0]) * CEIL_DIV(n, pipeline->wg_denoms[1]);
+        if (tiles < 2 * ctx->device->shader_core_count) {
+            split_k = std::min((uint32_t) skinny_split, 16u);
+            while (split_k > 1) {
+                const uint32_t k_split = ROUNDUP_POW2(CEIL_DIV(k, split_k), 256);
+                if (k_split * (split_k - 1) < k) {
+                    break;
+                }
+                split_k--;
+            }
+            static bool skinny_logged = false;
+            if (!skinny_logged) {
+                skinny_logged = true;
+                fprintf(stderr, "ggml_vulkan: skinny-M split-K engaged (first: m=%u n=%u k=%u tiles=%u -> split_k=%u)\n",
+                        m, n, k, tiles, split_k);
+            }
+        }
+    }
+
     return split_k;
 }
 
@@ -9715,14 +9753,16 @@ static void ggml_vk_matmul(
     while (base_work_group_z < batch) {
         uint32_t groups_z = std::min(batch - base_work_group_z, ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
 
-        GGML_ASSERT(fusion_flags == 0 && "fused mm tile epilog requires split_k == 1");
+        // the partial sums must not run through the epilog: a scale/unary-only epilog is applied by
+        // the reduce pass below instead (MUL-by-tensor / HC collapse never reach split_k > 1)
+        GGML_ASSERT((fusion_flags & ~(MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU)) == 0 && "only a scale/unary mm tile epilog can be applied by the split_k reduce");
         const vk_mat_mat_push_constants pc1 = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k_split, ne02, ne12, broadcast2, broadcast3, padded_n, 0, 1.0f, 1.0f, 0 };
         // Make sure enough workgroups get assigned for split k to work
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, split_k_buffer, d }, pc1, { (CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0]) * split_k, n, groups_z });
         base_work_group_z += groups_z;
     }
     ggml_vk_sync_buffers(ctx, subctx);
-    const std::array<uint32_t, 2> pc2 = { (uint32_t)(m * n * batch), split_k };
+    const vk_split_k_reduce_push_constants pc2 = { (uint32_t)(m * n * batch), split_k, fusion_flags, fuse_scale_pre, fuse_scale_post };
     ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_matmul_split_k_reduce, { split_k_buffer, d }, pc2, { m * n * batch, 1, 1 });
     ctx->prealloc_split_k_need_sync = true;
 }
@@ -10171,7 +10211,10 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     ctx->fused_mm_tile_mul = nullptr;
     ctx->fused_mm_tile_aux = 0;
 
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || mm_fusion_flags != 0, pipeline);
+    // a scale/unary-only epilog can move into the split_k reduce pass; MUL-by-tensor and the HC
+    // collapse index the D tile in the store and still require split_k == 1
+    const bool mm_fusion_blocks_split_k = (mm_fusion_flags & ~(MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU)) != 0;
+    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || mm_fusion_blocks_split_k, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);

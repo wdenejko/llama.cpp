@@ -12,7 +12,22 @@ layout (binding = 1) writeonly buffer D4 {vec4 data_d4[];};
 layout (push_constant) uniform parameter {
     uint ne;
     uint k_num;
+    // [MM_TILE_EPILOG under split_k] the fused scale/unary epilog that mul_mm cannot apply to
+    // partial sums is applied here, on the reduced value, with mul_mm's semantics:
+    // v = sum * scale_pre; sigmoid(v) or v * sigmoid(v); v * scale_post
+    uint  fusion_flags;   // 0x1 sigmoid, 0x2 silu (nothing else may reach the reduce)
+    float scale_pre;
+    float scale_post;
 } p;
+
+float epilog(float v) {
+    v *= p.scale_pre;
+    if ((p.fusion_flags & 3u) != 0u) {
+        const float sig = 1.0f / (1.0f + exp(-v));
+        v = ((p.fusion_flags & 2u) != 0u) ? v * sig : sig;
+    }
+    return v * p.scale_post;
+}
 
 void main() {
     // Each invocation handles four consecutive components
@@ -31,6 +46,9 @@ void main() {
             result += data_a4[(i * p.ne + idx) / 4];
         }
 
+        if (p.fusion_flags != 0u) {
+            result = vec4(epilog(result.x), epilog(result.y), epilog(result.z), epilog(result.w));
+        }
         data_d4[idx / 4] = result;
     } else {
         [[unroll]] for (uint j = 0; j < 4; ++j) {
@@ -41,7 +59,7 @@ void main() {
                     result += data_a[i * p.ne + idx + j];
                 }
 
-                data_d[idx + j] = result;
+                data_d[idx + j] = (p.fusion_flags != 0u) ? epilog(result) : result;
             }
         }
     }
