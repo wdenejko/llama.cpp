@@ -11063,6 +11063,14 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
                         (flags & MM_TILE_FUSION_COLLAPSE) ? "+hc_collapse" : (flags & MM_TILE_FUSION_MUL) ? "+mul" : "",
                         (long long) src0->ne[1], (long long) dst->ne[1]);
             }
+            // the line above only names the first fusion of the process (always the HC down GEMM's
+            // silu); report the HC collapse epilog separately so a runner log shows it engaged
+            static bool collapse_logged = false;
+            if (!collapse_logged && (flags & MM_TILE_FUSION_COLLAPSE)) {
+                collapse_logged = true;
+                fprintf(stderr, "ggml_vulkan: hc collapse epilog fusion engaged (first: m=%lld -> E=%lld n=%lld)\n",
+                        (long long) src0->ne[1], (long long) dst->ne[0], (long long) dst->ne[1]);
+            }
         }
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
     }
