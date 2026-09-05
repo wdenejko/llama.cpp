@@ -576,24 +576,38 @@ struct llama_mmap::impl {
         }
         char * p = (char *) addr + first;
         const size_t len = last - first;
+        // The lazy ranges are advised RANDOM (readahead off) so that on-demand faults after load stay
+        // single-page. Populating THROUGH that advice is one synchronous 4K read per page (a 27G table
+        // = ~7M reads, minutes). Switch to sequential and kick off bulk readahead for the populate,
+        // then restore RANDOM for the steady state.
+        if (posix_madvise(p, len, POSIX_MADV_SEQUENTIAL)) {
+            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_SEQUENTIAL) failed: %s\n", strerror(errno));
+        }
+        if (posix_madvise(p, len, POSIX_MADV_WILLNEED)) {
+            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n", strerror(errno));
+        }
+        auto restore_random = [&]() {
+            if (posix_madvise(p, len, POSIX_MADV_RANDOM)) {
+                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n", strerror(errno));
+            }
+        };
 #ifdef __linux__
 #ifndef MADV_POPULATE_READ
 #define MADV_POPULATE_READ 22   // Linux 5.14+
 #endif
         if (madvise(p, len, MADV_POPULATE_READ) == 0) {
+            restore_random();
             return;
         }
         LLAMA_LOG_DEBUG("madvise(MADV_POPULATE_READ) failed (%s), touching pages instead\n", strerror(errno));
 #endif
-        // older kernels / other platforms: hint readahead, then touch one byte per page
-        if (posix_madvise(p, len, POSIX_MADV_WILLNEED)) {
-            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n", strerror(errno));
-        }
+        // older kernels / other platforms: readahead was requested above, touch one byte per page
         volatile char sink = 0;
         for (size_t off = 0; off < len; off += page_size) {
             sink = (char) (sink + ((volatile const char *) p)[off]);
         }
         (void) sink;
+        restore_random();
     }
 
     void drop_page_cache(size_t first, size_t last) {

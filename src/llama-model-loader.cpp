@@ -1383,7 +1383,15 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const auto it_lazy = lazy_tensor_ranges.find(idx);
             static const llama_mmap::ranges no_lazy_ranges;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa,
+            // When ANY tensor is mapping-resident (lazy), every device tensor of the model is streamed
+            // through the fd and evicted as it goes — including those in shards that hold no lazy range
+            // themselves. Prefetching such a shard (MAP_POPULATE + whole-file WILLNEED) fills the page
+            // cache with tens of GB of MAPPED pages right before the device pin, which then has to
+            // reclaim them one by one: measured on a 4-shard 104G model, the 77G upload crawled at
+            // ~110 MB/s. So the no-prefetch rule is model-wide, not per file.
+            const bool prefetch_file = prefetch && lazy_tensor_ranges.empty();
+
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_file ? -1 : 0, is_numa,
                     it_lazy != lazy_tensor_ranges.end() ? it_lazy->second : no_lazy_ranges);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
