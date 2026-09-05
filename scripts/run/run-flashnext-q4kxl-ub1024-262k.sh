@@ -2,23 +2,36 @@
 # run-flashnext-q4kxl-ub1024-262k.sh
 # Qwen3.8-Flash-Next UD-Q4_K_XL (Unsloth base) · ubatch 1024 · ctx 262144 (the model's full context)
 # ONE fixed configuration — to change anything, edit this file. Source of truth: this file in the repo (scripts/run/).
+#
+# --load-mode mmap (NOT none): the 26.8G per-layer-token-embedding table (PLE, offloaded to the CPU) is served as a
+# mapping-resident, pre-populated, EVICTABLE file mapping instead of a 27G anonymous copy — ~27G of host headroom
+# back (validated 2026-09-05 at ub2048/262k: full fill with min 21.1G available, byte-identical greedy output; ub1024
+# needs strictly less). Under none this config sat at a few GB of headroom and OOM-killed under any concurrent host load.
+# Cost: under memory pressure the kernel evicts cold PLE rows, so a d0 prefill of a prompt with an unusually wide
+# vocabulary re-faults them; real code/prose prefill is within a few % (see the 2026-09-05 d0 diag in the commit message).
 set -u
 log() { echo "[$(basename "$0")] $*" >&2; }
 TOOLBOX=llama-vulkan-wdenejko
 BIN=/home/wdenejko/src/llama-qwen4exp-src/build-v2/bin
 MODEL=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL-a1perm/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf   # K1: base UD-Q4_K_XL with the 97 hc_*_up rows permuted channel-major + KV hyper_connection.up_perm=1 so the fused HC collapse epilog engages on the Q8_0 up-weights (+4.0% pp d0, lossless/greedy-identical). Fallback: UD-Q4_K_XL/ (base; already carries A1 F32-inject + correct D1 compress_ratios, no K1).
-DRAFT=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M-hcfix.gguf   # Q4 MTP head: with the PLE in RAM the Q8 head host-OOMs past ~129k
+DRAFT=/home/wdenejko/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M-hcfix.gguf   # Q4 MTP head (with the PLE mapping-resident the Q8 head would now fit at ub1024; not yet re-validated, so unchanged)
 CTX=262144
 UB=1024
 PORT=8080
 NEED_FREE_GB=100   # clean-box gate (a drained box shows ~118G free); a cleanliness check, not a fit predictor
 # the row-permuted a1perm model is only correct on a binary that reads hyper_connection.up_perm; an older build would silently misread the permuted rows
 grep -qa "hyper_connection.up_perm" "$BIN/libllama.so" 2>/dev/null || { log "ABORT: $BIN lacks hc up_perm support — it would misread the row-permuted a1perm model (serve UD-Q4_K_XL/ with that binary instead)"; exit 1; }
+# --load-mode mmap is only safe on a binary with the fixed mapping-resident loader (model-wide no-prefetch + bulk-readahead
+# populate): an older build MAP_POPULATEs the non-PLE shards under mmap, the 77G device pin then crawls at ~110 MB/s and a
+# kill mid-pin wedges TTM (reboot-only). The fixed loader carries the POSIX_MADV_SEQUENTIAL populate path.
+grep -qa "POSIX_MADV_SEQUENTIAL" "$BIN/libllama.so" 2>/dev/null || { log "ABORT: $BIN lacks the fixed mapping-resident loader — never serve --load-mode mmap on it"; exit 1; }
 # --- box safety (every measured wedge trigger): one server at a time; boot only into a drained, clean box ---
 if pgrep -f "alias flashnext" >/dev/null; then log "a flashnext llama-server is already running — stop it first"; exit 1; fi
 log "stopping comfyui + OCR for the duration"
 systemctl --user stop dashi-unlimited-ocr.service comfyui.service 2>/dev/null || true
 _shutdown() {   # podman only forwards signals with a TTY: kill the containerized server ourselves, then restore services
+  pkill -INT -f "$BIN/[l]lama-server" 2>/dev/null || true
+  for _ in $(seq 1 30); do pgrep -f "$BIN/[l]lama-server" >/dev/null || break; sleep 1; done
   pkill -f "$BIN/[l]lama-server" 2>/dev/null || true
   sleep 2
   systemctl --user start dashi-unlimited-ocr.service comfyui.service 2>/dev/null || true
@@ -43,10 +56,10 @@ log "memory ready: gtt=$(_gtt)G free=$(_free)G"
 podman restart "$TOOLBOX" >/dev/null 2>&1 || podman start "$TOOLBOX" >/dev/null 2>&1 || true   # fresh container: clean state for coopmat MTP graph init
 sleep 2
 
-log "UD-Q4_K_XL-a1perm (Unsloth base + K1 row-permute) ub=$UB ctx=$CTX load-mode=none kv=q8_0 mtp=Q4-draft(n4,pmin0.75) temp=1.0 reasoning=medium port=$PORT"
+log "UD-Q4_K_XL-a1perm (Unsloth base + K1 row-permute) ub=$UB ctx=$CTX load-mode=mmap (mapping-resident PLE) kv=q8_0 mtp=Q4-draft(n4,pmin0.75) temp=1.0 reasoning=medium port=$PORT"
 # not exec — the shell must survive to run the trap
 toolbox run --container "$TOOLBOX" env Q4X_RS_ROLLBACK=1 Q4X_QSA_BLK_TOPK=1 Q4X_QSA_GP=28672 Q4X_SPEC_STOCH=1 LD_LIBRARY_PATH="$BIN" \
-  "$BIN/llama-server" -m "$MODEL" --load-mode none \
+  "$BIN/llama-server" -m "$MODEL" --load-mode mmap \
     --alias flashnext --host 0.0.0.0 --port "$PORT" \
     -ngl 99 -c "$CTX" -ub "$UB" --flash-attn on -ctk q8_0 -ctv q8_0 \
     --override-tensor per_layer_token_embd.weight=CPU --metrics --parallel 1 \
