@@ -1307,11 +1307,27 @@ struct vk_mat_mat_push_constants {
     uint32_t fusion_flags;
     float fuse_scale_pre;
     float fuse_scale_post;
+    // [HC_COLLAPSE] hc for MM_TILE_FUSION_COLLAPSE (the fused hc-stream mean); 0 otherwise
+    uint32_t fuse_aux;
 };
 
-#define MM_TILE_FUSION_SIGMOID 0x1
-#define MM_TILE_FUSION_SILU    0x2
-#define MM_TILE_FUSION_MUL     0x4
+#define MM_TILE_FUSION_SIGMOID  0x1
+#define MM_TILE_FUSION_SILU     0x2
+#define MM_TILE_FUSION_MUL      0x4
+// [HC_COLLAPSE] MUL_MAT(w_up_perm, lo) -> Q4X_HC_MIX_COLLAPSE(xn, up_out) folded into the
+// tile store: sigmoid gate x xn (bound as the fmul operand) + hc-stream mean, writing
+// mixed [M/hc, N] directly so the [M, N] up_out is never materialized
+#define MM_TILE_FUSION_COLLAPSE 0x8
+
+// split_k reduce: sums the k_num partial products and, when a scale/unary mm tile epilog was
+// fused into a split_k matmul, applies it here (mul_mm cannot apply it to partial sums)
+struct vk_split_k_reduce_push_constants {
+    uint32_t ne;
+    uint32_t k_num;
+    uint32_t fusion_flags;   // MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU only
+    float    scale_pre;
+    float    scale_post;
+};
 
 #define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
@@ -1982,6 +1998,7 @@ struct vk_op_q4x_qsa_kv_gather_push_constants {
 };
 struct vk_op_q4x_hc_mix_collapse_push_constants {
     uint32_t E, hc, ne, sx1, su1, sd1;
+    uint32_t perm;   // 1 = up rows are channel-major (i*hc + c), the offline-permuted w_up layout
 };
 
 struct vk_op_q4x_hc_combine_push_constants {
@@ -2635,6 +2652,7 @@ struct ggml_backend_vk_context {
     float fused_mm_tile_scale_post {1.0f};
     int32_t fused_mm_tile_prec {};
     const ggml_tensor * fused_mm_tile_mul {};
+    uint32_t fused_mm_tile_aux {};   // [HC_COLLAPSE] hc
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -4647,6 +4665,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             l_warptile_mmq = l_warptile_mmq_int = { 256, 128, 128, 32, subgroup_size_8, 64, 2, tm_m, tn_m, tk_m, subgroup_size_8 };
             l_warptile_mmq_int_k = { 256, 128, 128, 32, subgroup_size_16, 64, 1, 4, 2, 1, subgroup_size_16 };
 
+            // EXPERIMENT (GGML_VK_DENSE_L_BK=32|64): deeper K block for the dense f16 large tile.
+            // The qwen4exp HC down GEMM (m=320 k=10240) runs 640 BK=16 iterations per workgroup
+            // and sits at ~7.4 TFLOPS while split-K (more WGs) only makes it slower, i.e. the
+            // per-iteration load->LDS->barrier->MMA chain is the wall; halving/quartering the
+            // iteration count is the cheapest probe. Applies to every dense f16-path large GEMM.
+            {
+                static const char * l_bk_env = getenv("GGML_VK_DENSE_L_BK");
+                const int l_bk = l_bk_env ? atoi(l_bk_env) : 0;
+                if (l_bk == 32 || l_bk == 64) {
+                    l_warptile[3] = (uint32_t) l_bk;
+                    fprintf(stderr, "ggml_vulkan: dense large tile BK=%d (GGML_VK_DENSE_L_BK)\n", l_bk);
+                }
+            }
+
             // EXPERIMENT (GGML_VK_DENSE_BM256=1): 256-tall dense large tile. The HC
             // low-rank pair (m=320 k=10240 n=2048) re-streams its 40MB B matrix once
             // per M-tile; BM 128->256 cuts that from 3 passes to 2. Warp grids keep
@@ -6201,7 +6233,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_NVFP4],   "get_rows_nvfp4_f32",   get_rows_nvfp4_f32_len,   get_rows_nvfp4_f32_data,   "main", 3, sizeof(vk_op_binary_push_constants), {1024, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_back_f32, "get_rows_back_f32", get_rows_back_f32_len, get_rows_back_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1, true);
 
-    ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, sizeof(vk_split_k_reduce_push_constants), {256 * 4, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
 
     for (auto &it : device->pipeline_fa_mask_opt) {
@@ -9618,6 +9650,34 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
         }
     }
 
+    // [Q4X_SKINNY_SPLITK] skinny-M long-K GEMMs (the qwen4exp HC low-rank down projection,
+    // m=320 k=10240 n=2048) tile to 48 large-tile workgroups on 40 CUs: too many for the
+    // heuristic above to split, far too few to occupy the device (measured ~7.4 TFLOPS vs ~17
+    // for the same tile on m=2560; the medium tile is worse still, 4.2). Split K so the grid
+    // fills the GPU; a fused scale/unary epilog then runs in the split_k reduce pass.
+    // Q4X_SKINNY_SPLITK=<n> (0/unset = off) is the A/B knob.
+    static const int skinny_split = getenv("Q4X_SKINNY_SPLITK") ? atoi(getenv("Q4X_SKINNY_SPLITK")) : 0;
+    if (split_k == 1 && skinny_split > 1 && ctx->device->shader_core_count != 0 &&
+        m >= pipeline->wg_denoms[0] && n >= pipeline->wg_denoms[1] && k >= 8192) {
+        const uint32_t tiles = CEIL_DIV(m, pipeline->wg_denoms[0]) * CEIL_DIV(n, pipeline->wg_denoms[1]);
+        if (tiles < 2 * ctx->device->shader_core_count) {
+            split_k = std::min((uint32_t) skinny_split, 16u);
+            while (split_k > 1) {
+                const uint32_t k_split = ROUNDUP_POW2(CEIL_DIV(k, split_k), 256);
+                if (k_split * (split_k - 1) < k) {
+                    break;
+                }
+                split_k--;
+            }
+            static bool skinny_logged = false;
+            if (!skinny_logged) {
+                skinny_logged = true;
+                fprintf(stderr, "ggml_vulkan: skinny-M split-K engaged (first: m=%u n=%u k=%u tiles=%u -> split_k=%u)\n",
+                        m, n, k, tiles, split_k);
+            }
+        }
+    }
+
     return split_k;
 }
 
@@ -9697,7 +9757,7 @@ static void ggml_vk_matmul(
         uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
         uint32_t split_k, uint32_t batch, uint32_t ne02, uint32_t ne12, uint32_t broadcast2, uint32_t broadcast3,
         uint32_t padded_n, uint32_t fusion_flags = 0, float fuse_scale_pre = 1.0f, float fuse_scale_post = 1.0f,
-        vk_subbuffer fmul = vk_subbuffer{}) {
+        vk_subbuffer fmul = vk_subbuffer{}, uint32_t fuse_aux = 0) {
         VK_LOG_DEBUG("ggml_vk_matmul(a: (" << a.buffer->buffer << ", " << a.offset << ", " << a.size << "), b: (" << b.buffer->buffer << ", " << b.offset << ", " << b.size << "), d: (" << d.buffer->buffer << ", " << d.offset << ", " << d.size << "), split_k: (" << (split_k_buffer.buffer != nullptr ? split_k_buffer.buffer->buffer : VK_NULL_HANDLE) << ", " << split_k_buffer.offset << ", " << split_k_buffer.size << "), m: " << m << ", n: " << n << ", k: " << k << ", stride_a: " << stride_a << ", stride_b: " << stride_b << ", stride_d: " << stride_d << ", batch_stride_a: " << batch_stride_a << ", batch_stride_b: " << batch_stride_b << ", batch_stride_d: " << batch_stride_d << ", split_k: " << split_k << ", batch: " << batch << ", ne02: " << ne02 << ", ne12: " << ne12 << ", broadcast2: " << broadcast2 << ", broadcast3: " << broadcast3 << ", padded_n: " << padded_n << ")");
     if (split_k == 1) {
         ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
@@ -9706,7 +9766,7 @@ static void ggml_vk_matmul(
         while (base_work_group_z < batch) {
             uint32_t groups_z = std::min(batch - base_work_group_z, ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
 
-            const vk_mat_mat_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k, ne02, ne12, broadcast2, broadcast3, padded_n, fusion_flags, fuse_scale_pre, fuse_scale_post };
+            const vk_mat_mat_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k, ne02, ne12, broadcast2, broadcast3, padded_n, fusion_flags, fuse_scale_pre, fuse_scale_post, fuse_aux };
             // binding 3 (fused MUL operand) is part of the layout; bind d as the dummy when unused
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, fmul.buffer != nullptr ? fmul : d }, pc, { m, n, groups_z });
             base_work_group_z += groups_z;
@@ -9730,14 +9790,16 @@ static void ggml_vk_matmul(
     while (base_work_group_z < batch) {
         uint32_t groups_z = std::min(batch - base_work_group_z, ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
 
-        GGML_ASSERT(fusion_flags == 0 && "fused mm tile epilog requires split_k == 1");
-        const vk_mat_mat_push_constants pc1 = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k_split, ne02, ne12, broadcast2, broadcast3, padded_n, 0, 1.0f, 1.0f };
+        // the partial sums must not run through the epilog: a scale/unary-only epilog is applied by
+        // the reduce pass below instead (MUL-by-tensor / HC collapse never reach split_k > 1)
+        GGML_ASSERT((fusion_flags & ~(MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU)) == 0 && "only a scale/unary mm tile epilog can be applied by the split_k reduce");
+        const vk_mat_mat_push_constants pc1 = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k_split, ne02, ne12, broadcast2, broadcast3, padded_n, 0, 1.0f, 1.0f, 0 };
         // Make sure enough workgroups get assigned for split k to work
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, split_k_buffer, d }, pc1, { (CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0]) * split_k, n, groups_z });
         base_work_group_z += groups_z;
     }
     ggml_vk_sync_buffers(ctx, subctx);
-    const std::array<uint32_t, 2> pc2 = { (uint32_t)(m * n * batch), split_k };
+    const vk_split_k_reduce_push_constants pc2 = { (uint32_t)(m * n * batch), split_k, fusion_flags, fuse_scale_pre, fuse_scale_post };
     ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_matmul_split_k_reduce, { split_k_buffer, d }, pc2, { m * n * batch, 1, 1 });
     ctx->prealloc_split_k_need_sync = true;
 }
@@ -10179,12 +10241,20 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const float    mm_fuse_scale_pre  = ctx->fused_mm_tile_scale_pre;
     const float    mm_fuse_scale_post = ctx->fused_mm_tile_scale_post;
     const ggml_tensor * mm_fusion_mul = ctx->fused_mm_tile_mul;
+    const uint32_t mm_fusion_aux      = ctx->fused_mm_tile_aux;
     ctx->fused_mm_tile_flags = 0;
     ctx->fused_mm_tile_scale_pre = 1.0f;
     ctx->fused_mm_tile_scale_post = 1.0f;
     ctx->fused_mm_tile_mul = nullptr;
+    ctx->fused_mm_tile_aux = 0;
 
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || mm_fusion_flags != 0, pipeline);
+    // a scale/unary-only epilog can move into the split_k reduce pass (only when the skinny-M
+    // split-K experiment is enabled, so the stock heuristic never starts splitting fused GEMMs);
+    // MUL-by-tensor and the HC collapse index the D tile in the store and always need split_k == 1
+    static const bool skinny_splitk_on = getenv("Q4X_SKINNY_SPLITK") && atoi(getenv("Q4X_SKINNY_SPLITK")) > 1;
+    const bool mm_fusion_blocks_split_k = mm_fusion_flags != 0 &&
+        (!skinny_splitk_on || (mm_fusion_flags & ~(MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU)) != 0);
+    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || mm_fusion_blocks_split_k, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
@@ -10347,7 +10417,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
         split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n,
         mm_fusion_flags, mm_fuse_scale_pre, mm_fuse_scale_post,
-        (mm_fusion_flags & MM_TILE_FUSION_MUL) ? ggml_vk_tensor_subbuffer(ctx, mm_fusion_mul) : vk_subbuffer{}
+        (mm_fusion_flags & (MM_TILE_FUSION_MUL | MM_TILE_FUSION_COLLAPSE)) ? ggml_vk_tensor_subbuffer(ctx, mm_fusion_mul) : vk_subbuffer{},
+        mm_fusion_aux
     );  // NOLINT
 
     if (x_non_contig || qx_needs_dequant) {
@@ -11043,6 +11114,17 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
                     const ggml_tensor * prev = cgraph->nodes[node_idx + k - 1];
                     ctx->fused_mm_tile_mul = n->src[0] == prev ? n->src[1] : n->src[0];
                     flags |= MM_TILE_FUSION_MUL;
+                } else if (n->op == GGML_OP_Q4X_HC_MIX_COLLAPSE) {
+                    // [HC_COLLAPSE] sigmoid gate on the accumulators, xn bound as the fmul
+                    // operand, hc-stream mean in the store; dst becomes mixed [M/hc, N]
+                    ctx->fused_mm_tile_mul = n->src[0];
+                    ctx->fused_mm_tile_aux = (uint32_t) ggml_get_op_params_i32(n, 0);
+                    flags |= MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_COLLAPSE;
+                    unary_seen = true;
+                    static const bool dbg_walk = getenv("GGML_VK_HC_COLLAPSE_DEBUG") != nullptr;
+                    if (dbg_walk) {
+                        fprintf(stderr, "[hc_collapse] walker FUSE node %d -> %s\n", node_idx, n->name);
+                    }
                 } else {
                     GGML_ASSERT(n->op == GGML_OP_UNARY);
                     flags |= ggml_get_unary_op(n) == GGML_UNARY_OP_SIGMOID ? MM_TILE_FUSION_SIGMOID
@@ -11061,8 +11143,16 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
                 epilog_logged = true;
                 fprintf(stderr, "ggml_vulkan: mm tile epilog fusion engaged (first: %s%s m=%lld n=%lld)\n",
                         (flags & MM_TILE_FUSION_SILU) ? "silu" : (flags & MM_TILE_FUSION_SIGMOID) ? "sigmoid" : "",
-                        (flags & MM_TILE_FUSION_MUL) ? "+mul" : "",
+                        (flags & MM_TILE_FUSION_COLLAPSE) ? "+hc_collapse" : (flags & MM_TILE_FUSION_MUL) ? "+mul" : "",
                         (long long) src0->ne[1], (long long) dst->ne[1]);
+            }
+            // the line above only names the first fusion of the process (always the HC down GEMM's
+            // silu); report the HC collapse epilog separately so a runner log shows it engaged
+            static bool collapse_logged = false;
+            if (!collapse_logged && (flags & MM_TILE_FUSION_COLLAPSE)) {
+                collapse_logged = true;
+                fprintf(stderr, "ggml_vulkan: hc collapse epilog fusion engaged (first: m=%lld -> E=%lld n=%lld)\n",
+                        (long long) src0->ne[1], (long long) dst->ne[0], (long long) dst->ne[1]);
             }
         }
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
@@ -15071,11 +15161,17 @@ static void ggml_vk_q4x_hc_mix_collapse(ggml_backend_vk_context * ctx, vk_contex
     const uint32_t E  = (uint32_t) dst->ne[0];
     const uint32_t nt = (uint32_t) dst->ne[1];
 
+    static const bool dbg_sa = getenv("GGML_VK_HC_COLLAPSE_DEBUG") != nullptr;
+    if (dbg_sa) {
+        fprintf(stderr, "[hc_collapse] STANDALONE %s perm=%d nt=%u\n", dst->name, ggml_get_op_params_i32(dst, 1), nt);
+    }
+
     const vk_op_q4x_hc_mix_collapse_push_constants pc = {
         E, (uint32_t) ggml_get_op_params_i32(dst, 0), E * nt,
         (uint32_t) (xn->nb[1] / sizeof(float)),
         (uint32_t) (up->nb[1] / sizeof(float)),
         (uint32_t) (dst->nb[1] / sizeof(float)),
+        (uint32_t) ggml_get_op_params_i32(dst, 1),
     };
 
     vk_pipeline pipeline = ctx->device->pipeline_q4x_hc_mix_collapse;
@@ -19018,6 +19114,48 @@ static bool ggml_vk_can_fuse_mm_tile_epilog(const ggml_backend_vk_context * ctx,
         return false;
     }
 
+    // [HC_COLLAPSE] MUL_MAT(w_up_perm, lo) -> Q4X_HC_MIX_COLLAPSE(xn, up_out): fold the
+    // sigmoid gate, the multiply by xn and the hc-stream mean into the tile store and
+    // write mixed [M/hc, N] directly (the [M, N] up_out is never materialized). Needs the
+    // offline-permuted w_up (collapse op_param perm == 1), a single-use mm, xn with the
+    // shape/stride of up_out, batch 1, and KHR coopmat tiles whose row count divides by hc
+    // (the hc stream-rows of a channel must share one coopmat tile). ggml_can_fuse can't
+    // be used here: it insists on same-shape chain nodes and mixed is M/hc tall.
+    if (num_extra == 1 && cgraph->nodes[node_idx + 1]->op == GGML_OP_Q4X_HC_MIX_COLLAPSE) {
+        static const bool dbg = getenv("GGML_VK_HC_COLLAPSE_DEBUG") != nullptr;
+        const ggml_tensor * cl = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * xn = cl->src[0];
+        const int32_t hc   = ggml_get_op_params_i32(cl, 0);
+        const int32_t perm = ggml_get_op_params_i32(cl, 1);
+        const char * why = nullptr;
+        if (perm != 1 || hc <= 0 || cl->src[1] != mm || cl->type != GGML_TYPE_F32) {
+            why = "perm/hc/src1/type";
+        } else if ((cl->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            why = "collapse lacks COMPUTE flag";
+        } else if (!ggml_node_has_n_uses(cgraph, node_idx, 1)) {
+            why = "mm not single-use";
+        } else if (mm->ne[2] != 1 || mm->ne[3] != 1 || mm->ne[0] % hc != 0) {
+            why = "batch/M";
+        } else if (cl->ne[0] != mm->ne[0] / hc || cl->ne[1] != mm->ne[1]) {
+            why = "dst shape";
+        } else if (xn->type != GGML_TYPE_F32 || !ggml_are_same_shape(xn, mm)) {
+            why = "xn type/shape";
+        } else if (!ggml_is_contiguous(xn)) {
+            why = "xn not contiguous";
+        } else if (get_misalign_bytes(ctx, xn) != 0) {
+            why = "xn misaligned";
+        } else if (!ctx->device->coopmat_support || ctx->device->coopmat_m % (uint32_t) hc != 0) {
+            why = "device tiles";
+        }
+        if (dbg) {
+            fprintf(stderr, "[hc_collapse] matcher node %d %s%s%s  mm=%s xn=%s(view_src=%s off=%zu) cl=%s uses(mm)=%d\n",
+                    node_idx, why ? "REJECT: " : "ACCEPT", why ? why : "", "",
+                    mm->name, xn->name, xn->view_src ? xn->view_src->name : "-", (size_t) xn->view_offs,
+                    cl->name, (int) ggml_node_get_use_count(cgraph, node_idx));
+        }
+        return why == nullptr;
+    }
+
     enum ggml_op ops[5];
     ops[0] = GGML_OP_MUL_MAT;
 
@@ -20035,7 +20173,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = 1;
                 fusion_string = "MM_TILE_EPILOG";
                 op_srcs_fused_elementwise[0] = false;
-                op_srcs_fused_elementwise[1] = true;
+                // the HC collapse reads xn [M,N] but writes mixed [M/hc,N]: not elementwise
+                op_srcs_fused_elementwise[1] = cgraph->nodes[i + 1]->op != GGML_OP_Q4X_HC_MIX_COLLAPSE;
             } else if (ggml_vk_can_fuse_mmv_epilog(ctx, cgraph, i, 3)) {
                 ctx->num_additional_fused_ops = 3;
                 fusion_string = "MUL_MAT_EPILOG";
@@ -20233,6 +20372,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                                 }
                                 if (!found) {
                                     need_disable = true;
+                                    static const bool dbg_ov = getenv("GGML_VK_HC_COLLAPSE_DEBUG") != nullptr;
+                                    if (dbg_ov && ctx->num_additional_fused_ops == 1 &&
+                                        cgraph->nodes[i + 1]->op == GGML_OP_Q4X_HC_MIX_COLLAPSE) {
+                                        fprintf(stderr, "[hc_collapse] DISABLE node %d: src %s (k=%d s=%u) overlaps dst %s\n",
+                                                i, src->name, k, s, dst->name);
+                                    }
                                 }
                             }
                         }
@@ -20244,6 +20389,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
+                // the node runs unfused: don't let the perf logger label it with the fusion
+                fusion_string = nullptr;
             }
         }
 
@@ -20484,7 +20631,10 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * 
                    (a->op == GGML_OP_MUL_MAT    && b->op == GGML_OP_MUL)    ||
                    (a->op == GGML_OP_SCALE      && b->op == GGML_OP_UNARY)  ||
                    (a->op == GGML_OP_UNARY      && b->op == GGML_OP_SCALE)  ||
-                   (a->op == GGML_OP_UNARY      && b->op == GGML_OP_MUL);
+                   (a->op == GGML_OP_UNARY      && b->op == GGML_OP_MUL)    ||
+                   // qwen4exp HC up-projection + stream collapse (mm tile epilog, see
+                   // ggml_vk_can_fuse_mm_tile_epilog): must stay adjacent or the fusion is lost
+                   (a->op == GGML_OP_MUL_MAT    && b->op == GGML_OP_Q4X_HC_MIX_COLLAPSE);
         };
 
         const int NUM_TO_CHECK = 20;

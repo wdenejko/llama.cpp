@@ -6623,7 +6623,9 @@ struct ggml_tensor * ggml_q4x_hc_mix_collapse(
         struct ggml_context * ctx,
         struct ggml_tensor  * xn,
         struct ggml_tensor  * up,
-        int32_t               hc) {
+        int32_t               hc,
+        int32_t               perm,
+        struct ggml_tensor  * keep) {
     GGML_ASSERT(xn->type == GGML_TYPE_F32);
     GGML_ASSERT(up->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(xn));
@@ -6635,10 +6637,12 @@ struct ggml_tensor * ggml_q4x_hc_mix_collapse(
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, xn->ne[0]/hc, xn->ne[1]);
 
     ggml_set_op_params_i32(result, 0, hc);
+    ggml_set_op_params_i32(result, 1, perm);
 
     result->op     = GGML_OP_Q4X_HC_MIX_COLLAPSE;
     result->src[0] = xn;
     result->src[1] = up;
+    result->src[2] = keep; // keep-alive only (see ggml.h); may be NULL
 
     return result;
 }

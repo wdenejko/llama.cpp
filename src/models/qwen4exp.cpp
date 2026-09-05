@@ -25,6 +25,9 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
     ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
+    // [HC_COLLAPSE] set by the offline w_up row-permute: hc_*_up rows are channel-major, which
+    // lets the Vulkan mul_mm epilog fuse the mix collapse into the up-projection's store
+    ml.get_key(LLM_KV_HYPER_CONNECTION_UP_PERM,  hparams.hc_up_perm, false);
     GGML_ASSERT(hparams.dsv4_hc_mult > 0 && hparams.hc_low_rank > 0);
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
@@ -296,8 +299,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+    // A2: multiply by the per-(channel,stream) gamma BEFORE flattening, so RMS_NORM and MUL stay
+    // adjacent and the Vulkan RMS_NORM_MUL fusion fires (the reshape between them blocked it).
+    // w_norm is [hc_dim] laid out n_embd-fastest == [n_embd, hc]; the fused rms_norm shader indexes
+    // src1 as src1_idx(0,row,channel,samp)+col, so [n_embd, hc, 1] broadcasts over the token axis.
+    xn = ggml_mul(ctx0, xn, ggml_reshape_3d(ctx0, w_norm, n_embd, hc, 1));
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
@@ -311,9 +318,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // Q4X_HC_MIX_NOFUSE=1 forces the primitive chain (A/B and correctness checks).
     static const bool q4x_mix_nofuse = getenv("Q4X_HC_MIX_NOFUSE") != nullptr;
 
+    // [HC_COLLAPSE] with the offline-permuted w_up (hparams.hc_up_perm) up_out's rows are
+    // channel-major, so only the perm-aware collapse op reads them correctly: force the fused
+    // op (the primitive chain below assumes stream-major rows). On Vulkan the backend then
+    // folds this op into the up-projection's mul_mm store and up_out is never materialized.
     ggml_tensor * mixed;
-    if (!q4x_mix_nofuse) {
-        mixed = ggml_q4x_hc_mix_collapse(ctx0, xn, up_out, (int32_t) hc);
+    if (!q4x_mix_nofuse || hparams.hc_up_perm != 0) {
+        // lo rides along as the keep-alive src so the allocator cannot hand its (dead) slot to
+        // mixed: the fused epilog writes mixed while the up GEMM's other workgroups still read lo,
+        // and the backend refuses that overlap by dropping the fusion for the layer.
+        mixed = ggml_q4x_hc_mix_collapse(ctx0, xn, up_out, (int32_t) hc, (int32_t) hparams.hc_up_perm, lo);
         cb(mixed, "hc_mixed", il);
     } else {
         ggml_tensor * gate = ggml_sigmoid(ctx0, up_out);
@@ -456,9 +470,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(e_norm, "mtp_enorm", il);
 
     // fc_embedding(e) + fc_hidden(h) is one projection of the concatenation; the converter
-    // merges the two checkpoint tensors into this single eh_proj
-    ggml_tensor * inpL = build_lora_mm(layer.nextn.eh_proj,
-            ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+    // merges the two checkpoint tensors into this single eh_proj.
+    // Fold the hc streams into the column dimension so the projection is ONE GEMM with
+    // n = hc*n_tokens. As a [2*n_embd, hc, n_tokens] operand the backends treat n_tokens as a
+    // batch of mat-vecs with n = hc and re-read the weight once per token: measured 44 ms per
+    // 512-token draft ubatch on gfx1151, 58% of the draft's prefill GPU time and ~4.5% of the
+    // served prefill. Every output column is the same dot product either way; eh_proj_s is a
+    // scalar, so it broadcasts over the 2D result just as it did over the 3D one.
+    ggml_tensor * eh_in = ggml_concat(ctx0, e_norm, h_norm, 0);   // [2*n_embd, hc, n_tokens], contiguous
+    eh_in = ggml_reshape_2d(ctx0, eh_in, 2*n_embd, hc*n_tokens);
+    ggml_tensor * inpL = build_lora_mm(layer.nextn.eh_proj, eh_in, layer.nextn.eh_proj_s);
+    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_tokens);
     cb(inpL, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
@@ -1849,7 +1871,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     // cont the transposed activations before the concat: concat's non-contiguous path costs
     // ~13ms per GDN layer on 2048-token prefill chunks (~463ms per chunk over 36 layers,
     // measured on gfx1151 by the apepojken fork - +8% prefill at every depth from this line)
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_cont(ctx0, ggml_transpose(ctx0, x)), 0);
+    // A3 (measured +4.2% pp d0, byte-exact): the transposed-concat kernel subsumes the explicit
+    // cont, which the stale comment above credited with +8% before that kernel existed. Default now
+    // DROPS the cont; Q4X_A3_KEEP_CONT=1 restores it (regression fallback).
+    ggml_tensor * xt = ggml_transpose(ctx0, x);
+    { static const bool a3_keep_cont = getenv("Q4X_A3_KEEP_CONT") != nullptr; if (a3_keep_cont) xt = ggml_cont(ctx0, xt); }
+    ggml_tensor * conv_input = ggml_concat(ctx0, state, xt, 0);
 
     // keep the last state_cols columns for the next ubatch
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);

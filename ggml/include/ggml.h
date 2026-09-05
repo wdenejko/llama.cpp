@@ -2693,11 +2693,19 @@ extern "C" {
 
     // [Q4X] qwen4exp HC mix tail: out[i,t] = (1/hc) * sum_c xn[c*E+i,t] * sigmoid(up[c*E+i,t])
     // where E = xn->ne[0]/hc. Replaces sigmoid+mul+cont+(hc-1) adds+scale.
+    // perm=1: up's rows are channel-major (i*hc + c) — the offline-permuted w_up layout that
+    // lets the Vulkan mul_mm epilog fuse this op into the up-projection's store.
+    // keep (optional, src[2], never read by the kernels): a tensor held live through this op,
+    // i.e. the up-projection's input. Without it the allocator may place the result over that
+    // dead input, and the fused epilog (which writes the result while the GEMM still reads its
+    // input) has to be disabled for that layer.
     GGML_API struct ggml_tensor * ggml_q4x_hc_mix_collapse(
             struct ggml_context * ctx,
             struct ggml_tensor  * xn,
             struct ggml_tensor  * up,
-            int32_t               hc);
+            int32_t               hc,
+            int32_t               perm,
+            struct ggml_tensor  * keep);
 
     GGML_API struct ggml_tensor * ggml_q4x_hc_combine(
             struct ggml_context * ctx,

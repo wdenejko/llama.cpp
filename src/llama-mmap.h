@@ -55,6 +55,13 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // fault the pages of [first, last) in now (MADV_POPULATE_READ where available, else
+    // readahead + touch) so a mapping-resident tensor is never paged in row by row on first use
+    void populate(size_t first, size_t last);
+    // drop the page-cache copy of the file bytes [first, last) once they have been consumed
+    // (streamed to a device through the fd); only whole pages inside the range are affected
+    void drop_page_cache(size_t first, size_t last);
+
     static const bool SUPPORTED;
 
 private:

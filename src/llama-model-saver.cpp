@@ -316,6 +316,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     add_kv(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
     add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK,             hparams.hc_low_rank);
+    add_kv(LLM_KV_HYPER_CONNECTION_UP_PERM,              hparams.hc_up_perm);
 
     // the PLE group only means anything whole: write all of it or none
     if (hparams.ple_n_heads > 0) {

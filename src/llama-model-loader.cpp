@@ -1383,7 +1383,15 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const auto it_lazy = lazy_tensor_ranges.find(idx);
             static const llama_mmap::ranges no_lazy_ranges;
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa,
+            // When ANY tensor is mapping-resident (lazy), every device tensor of the model is streamed
+            // through the fd and evicted as it goes — including those in shards that hold no lazy range
+            // themselves. Prefetching such a shard (MAP_POPULATE + whole-file WILLNEED) fills the page
+            // cache with tens of GB of MAPPED pages right before the device pin, which then has to
+            // reclaim them one by one: measured on a 4-shard 104G model, the 77G upload crawled at
+            // ~110 MB/s. So the no-prefetch rule is model-wide, not per file.
+            const bool prefetch_file = prefetch && lazy_tensor_ranges.empty();
+
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_file ? -1 : 0, is_numa,
                     it_lazy != lazy_tensor_ranges.end() ? it_lazy->second : no_lazy_ranges);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
@@ -1480,7 +1488,10 @@ bool llama_model_loader::load_all_data(
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
+        // NOTE: with mmap enabled on an iGPU we still want the async pinned-buffer upload for
+        // GPU/device tensors (host tensors take the mmap zero-copy path in load_all_data and
+        // never reach here). So gate only on check_tensors, not on use_mmap.
+        if (check_tensors) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -1575,12 +1586,16 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        if (use_mmap) {
+        // Only tensors destined for an mmap-backed (host) buffer take the zero-copy mmap
+        // path; those are not yet allocated (cur->data == nullptr) and have a buffer in bufs.
+        // Everything else (GPU/device tensors, already allocated by alloc_ctx_tensors) loads
+        // from the file below, using the fast async pinned-buffer upload when available. This
+        // lets a CPU --override-tensor offload stay mmap-backed / on-demand / evictable while
+        // GPU weights avoid the slow synchronous copy-from-mmap.
+        const bool mmap_zero_copy = use_mmap && cur->data == nullptr && bufs.count(weight->idx);
+        if (mmap_zero_copy) {
             const auto & mapping = mappings.at(weight->idx);
-            ggml_backend_buffer_t buf_mmap = nullptr;
-            if (bufs.count(weight->idx)) {
-                buf_mmap = bufs.at(weight->idx);
-            }
+            ggml_backend_buffer_t buf_mmap = bufs.at(weight->idx);
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
             if (check_tensors) {
@@ -1589,20 +1604,15 @@ bool llama_model_loader::load_all_data(
                 }));
             }
 
-            GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
-            if (buf_mmap && cur->data == nullptr) {
-                ggml_backend_tensor_alloc(buf_mmap, cur, data);
-                if (lmlocks) {
-                    const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
-                }
-
-                auto & mmap_used = mmaps_used[weight->idx];
-                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
-                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
-            } else {
-                ggml_backend_tensor_set(cur, data, 0, n_size);
+            ggml_backend_tensor_alloc(buf_mmap, cur, data);
+            if (lmlocks) {
+                const auto & lmlock = lmlocks->at(weight->idx);
+                lmlock->grow_to(weight->offs + n_size);
             }
+
+            auto & mmap_used = mmaps_used[weight->idx];
+            mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+            mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
         } else {
             const auto & file = files.at(weight->idx);
 
@@ -1668,6 +1678,12 @@ bool llama_model_loader::load_all_data(
                         ++buffer_idx;
                         buffer_idx %= n_buffers;
                     }
+                    if (use_mmap && weight->idx < mappings.size() && mappings.at(weight->idx)) {
+                        // the pages just streamed through the fd are now on the device: evict them so the
+                        // page cache keeps room for the mapping-resident host tensors (and a warm re-boot
+                        // does not start out under memory pressure)
+                        mappings.at(weight->idx)->drop_page_cache(read_start, read_end);
+                    }
                 } else {
                     read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
@@ -1717,6 +1733,24 @@ bool llama_model_loader::load_all_data(
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
+            }
+            // fault the mapping-resident (lazy) host tensors in now that the device uploads are done
+            // and their pages evicted: a PLE that is paged in row by row on first use halves prefill
+            // (measured); populated last, its pages are also the freshest in the page cache
+            if (!lazy_tensor_ranges.empty()) {
+                const int64_t t_populate = ggml_time_us();
+                size_t n_populated = 0;
+                for (const auto & kv : lazy_tensor_ranges) {
+                    if (kv.first >= mappings.size() || !mappings.at(kv.first)) {
+                        continue;
+                    }
+                    for (const auto & r : kv.second) {
+                        mappings.at(kv.first)->populate(r.first, r.second);
+                        n_populated += r.second - r.first;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: populated %.2f GiB of mapping-resident tensors in %.1f s\n", __func__,
+                        n_populated / (1024.0 * 1024.0 * 1024.0), (ggml_time_us() - t_populate) / 1e6);
             }
         }
         if (progress_callback) {
