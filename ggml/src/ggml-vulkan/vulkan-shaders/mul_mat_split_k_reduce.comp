@@ -15,7 +15,7 @@ layout (push_constant) uniform parameter {
     // [MM_TILE_EPILOG under split_k] the fused scale/unary epilog that mul_mm cannot apply to
     // partial sums is applied here, on the reduced value, with mul_mm's semantics:
     // v = sum * scale_pre; sigmoid(v) or v * sigmoid(v); v * scale_post
-    uint  fusion_flags;   // 0x1 sigmoid, 0x2 silu (nothing else may reach the reduce)
+    uint  fusion_flags;   // 0x1 sigmoid, 0x2 silu, 0x10 relu (only pure unaries reach the reduce)
     float scale_pre;
     float scale_post;
 } p;
@@ -25,6 +25,8 @@ float epilog(float v) {
     if ((p.fusion_flags & 3u) != 0u) {
         const float sig = 1.0f / (1.0f + exp(-v));
         v = ((p.fusion_flags & 2u) != 0u) ? v * sig : sig;
+    } else if ((p.fusion_flags & 0x10u) != 0u) {
+        v = max(v, 0.0f);
     }
     return v * p.scale_post;
 }

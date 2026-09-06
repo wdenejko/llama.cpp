@@ -1063,8 +1063,11 @@ llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qs
     // (q is the rope output, already contiguous, so it reshapes directly)
     ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
             ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+    // relu directly on the GEMM output (before the reshape) so the Vulkan tile-matmul epilog can
+    // fuse it (MM_TILE_FUSION_RELU) instead of a separate RELU pass over the whole score tensor,
+    // which is ~113 ms at 128k. relu is elementwise, so reshaping after is numerically identical.
     score = ggml_relu(ctx0, score);
+    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
 
     // the heads sit side by side on ne[1] and there are only a few of them
     ggml_tensor * summed = nullptr;

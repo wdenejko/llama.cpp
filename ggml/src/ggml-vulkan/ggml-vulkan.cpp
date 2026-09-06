@@ -1332,6 +1332,7 @@ struct vk_mat_mat_push_constants {
 #define MM_TILE_FUSION_SIGMOID  0x1
 #define MM_TILE_FUSION_SILU     0x2
 #define MM_TILE_FUSION_MUL      0x4
+#define MM_TILE_FUSION_RELU     0x10   // [MM_TILE_EPILOG] pure-unary relu on the accumulators
 // [HC_COLLAPSE] MUL_MAT(w_up_perm, lo) -> Q4X_HC_MIX_COLLAPSE(xn, up_out) folded into the
 // tile store: sigmoid gate x xn (bound as the fmul operand) + hc-stream mean, writing
 // mixed [M/hc, N] directly so the [M, N] up_out is never materialized
@@ -9832,7 +9833,7 @@ static void ggml_vk_matmul(
 
         // the partial sums must not run through the epilog: a scale/unary-only epilog is applied by
         // the reduce pass below instead (MUL-by-tensor / HC collapse never reach split_k > 1)
-        GGML_ASSERT((fusion_flags & ~(MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU)) == 0 && "only a scale/unary mm tile epilog can be applied by the split_k reduce");
+        GGML_ASSERT((fusion_flags & ~(MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU | MM_TILE_FUSION_RELU)) == 0 && "only a scale/unary mm tile epilog can be applied by the split_k reduce");
         const vk_mat_mat_push_constants pc1 = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k_split, ne02, ne12, broadcast2, broadcast3, padded_n, 0, 1.0f, 1.0f, 0 };
         // Make sure enough workgroups get assigned for split k to work
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, split_k_buffer, d }, pc1, { (CEIL_DIV(m, pipeline->wg_denoms[0]) * pipeline->wg_denoms[0]) * split_k, n, groups_z });
@@ -10293,7 +10294,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     // MUL-by-tensor and the HC collapse index the D tile in the store and always need split_k == 1
     static const bool skinny_splitk_on = getenv("Q4X_SKINNY_SPLITK") && atoi(getenv("Q4X_SKINNY_SPLITK")) > 1;
     const bool mm_fusion_blocks_split_k = mm_fusion_flags != 0 &&
-        (!skinny_splitk_on || (mm_fusion_flags & ~(MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU)) != 0);
+        (!skinny_splitk_on || (mm_fusion_flags & ~(MM_TILE_FUSION_SIGMOID | MM_TILE_FUSION_SILU | MM_TILE_FUSION_RELU)) != 0);
     const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k || mm_fusion_blocks_split_k, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
@@ -11167,8 +11168,10 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
                     }
                 } else {
                     GGML_ASSERT(n->op == GGML_OP_UNARY);
-                    flags |= ggml_get_unary_op(n) == GGML_UNARY_OP_SIGMOID ? MM_TILE_FUSION_SIGMOID
-                                                                           : MM_TILE_FUSION_SILU;
+                    const ggml_unary_op uop = ggml_get_unary_op(n);
+                    flags |= uop == GGML_UNARY_OP_SIGMOID ? MM_TILE_FUSION_SIGMOID
+                           : uop == GGML_UNARY_OP_RELU    ? MM_TILE_FUSION_RELU
+                                                          : MM_TILE_FUSION_SILU;
                     unary_seen = true;
                 }
             }
@@ -11182,7 +11185,7 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
             if (!epilog_logged) {
                 epilog_logged = true;
                 fprintf(stderr, "ggml_vulkan: mm tile epilog fusion engaged (first: %s%s m=%lld n=%lld)\n",
-                        (flags & MM_TILE_FUSION_SILU) ? "silu" : (flags & MM_TILE_FUSION_SIGMOID) ? "sigmoid" : "",
+                        (flags & MM_TILE_FUSION_SILU) ? "silu" : (flags & MM_TILE_FUSION_SIGMOID) ? "sigmoid" : (flags & MM_TILE_FUSION_RELU) ? "relu" : "",
                         (flags & MM_TILE_FUSION_COLLAPSE) ? "+hc_collapse" : (flags & MM_TILE_FUSION_MUL) ? "+mul" : "",
                         (long long) src0->ne[1], (long long) dst->ne[1]);
             }
@@ -19326,16 +19329,22 @@ static bool ggml_vk_can_fuse_mm_tile_epilog(const ggml_backend_vk_context * ctx,
             }
             (unary_seen ? scale_post : scale_pre) = true;
             break;
-        case GGML_OP_UNARY:
+        case GGML_OP_UNARY: {
             if (mul_seen || unary_seen) {
                 return false;
             }
-            if (ggml_get_unary_op(n) != GGML_UNARY_OP_SILU &&
-                ggml_get_unary_op(n) != GGML_UNARY_OP_SIGMOID) {
+            // GGML_VK_DISABLE_RELU_EPILOG=1 keeps relu a separate op (A/B and a safety disable);
+            // silu/sigmoid are unaffected. Ours.
+            static const bool relu_epilog = getenv("GGML_VK_DISABLE_RELU_EPILOG") == nullptr;
+            const ggml_unary_op uop = ggml_get_unary_op(n);
+            const bool unary_ok = uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_SIGMOID ||
+                                  (uop == GGML_UNARY_OP_RELU && relu_epilog);
+            if (!unary_ok) {
                 return false;
             }
             unary_seen = true;
             break;
+        }
         case GGML_OP_MUL: {
             if (!allow_mul || mul_seen) {
                 return false;

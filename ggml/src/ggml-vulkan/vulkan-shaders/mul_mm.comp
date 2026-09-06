@@ -474,6 +474,7 @@ void main() {
     if (p.fusion_flags != 0u) {
         const bool ep_unary = (p.fusion_flags & 3u) != 0u;
         const bool ep_silu  = (p.fusion_flags & 2u) != 0u;
+        const bool ep_relu  = (p.fusion_flags & 0x10u) != 0u;
 #ifdef COOPMAT
         [[unroll]] for (uint j = 0; j < cms_per_row * cms_per_col; j++) {
             [[unroll]] for (uint i = 0; i < sums[j].length(); ++i) {
@@ -481,6 +482,8 @@ void main() {
                 if (ep_unary) {
                     const float sig = 1.0f / (1.0f + exp(-fv));
                     fv = ep_silu ? fv * sig : sig;
+                } else if (ep_relu) {
+                    fv = max(fv, 0.0f);
                 }
                 sums[j][i] = ACC_TYPE(fv * p.fuse_scale_post);
             }
@@ -494,6 +497,9 @@ void main() {
                 const float sy = 1.0f / (1.0f + exp(-fy));
                 fx = ep_silu ? fx * sx : sx;
                 fy = ep_silu ? fy * sy : sy;
+            } else if (ep_relu) {
+                fx = max(fx, 0.0f);
+                fy = max(fy, 0.0f);
             }
             sums[i].x = ACC_TYPE(fx * p.fuse_scale_post);
             sums[i].y = ACC_TYPE(fy * p.fuse_scale_post);
