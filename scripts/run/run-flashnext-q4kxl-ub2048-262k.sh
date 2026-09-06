@@ -8,8 +8,9 @@
 # headroom that lets ub2048 fill the full 262k window on the 123G box (validated 2026-09-05: fill to 253952 with
 # min 21.1G available, tg 29.6 t/s at 254k, greedy output byte-identical to --load-mode none). Under none the same
 # config OOM-kills at ~192k of fill and sits at ~3G available with an EMPTY context at 196k.
-# Cost: under memory pressure the kernel evicts cold PLE rows, so a d0 prefill of a prompt with an unusually wide
-# vocabulary re-faults them (random-token probe: -25..-29%); deep prefill is unaffected, real prose ~0%, real code -5% median (-2% once warm)
+# The eviction cost is covered by the PLE row prefetch (2026-09-06): the server hints the next ubatch's
+# per-layer-token-embedding rows (MADV_WILLNEED) while the current one computes, so re-faults leave the
+# critical path; measured within 1-3% of the anonymous-PLE (--load-mode none @196k) config at 40-60k depth.
 # (see the 2026-09-05 d0 diag numbers in the commit message).
 set -u
 log() { echo "[$(basename "$0")] $*" >&2; }

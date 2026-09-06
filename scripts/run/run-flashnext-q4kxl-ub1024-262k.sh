@@ -7,8 +7,9 @@
 # mapping-resident, pre-populated, EVICTABLE file mapping instead of a 27G anonymous copy — ~27G of host headroom
 # back (validated 2026-09-05 at ub2048/262k: full fill with min 21.1G available, byte-identical greedy output; ub1024
 # needs strictly less). Under none this config sat at a few GB of headroom and OOM-killed under any concurrent host load.
-# Cost: under memory pressure the kernel evicts cold PLE rows, so a d0 prefill of a prompt with an unusually wide
-# vocabulary re-faults them; real code/prose prefill is within a few % (see the 2026-09-05 d0 diag in the commit message).
+# The eviction cost is covered by the PLE row prefetch (2026-09-06): the server hints the next ubatch's
+# per-layer-token-embedding rows (MADV_WILLNEED) while the current one computes, so re-faults leave the
+# critical path; measured within 1-3% of the anonymous-PLE (--load-mode none @196k) config at 40-60k depth.
 set -u
 log() { echo "[$(basename "$0")] $*" >&2; }
 TOOLBOX=llama-vulkan-wdenejko
