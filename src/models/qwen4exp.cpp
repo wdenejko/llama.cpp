@@ -5,6 +5,11 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <thread>
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <cinttypes>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
@@ -1895,6 +1900,108 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+}
+
+// [Q4X_PLE_PREFETCH] The PLE table is a 27G mapping-resident (TENSOR_READ_LAZY) host tensor gathered on
+// the CPU at the start of every ubatch. On a box that cannot keep the whole table resident, that gather
+// page-faults its rows in one by one, serially with the GPU work (measured: a 2048-token real-code
+// prefill loses 15-25% to those faults). The rows are a pure function of the tokens, so they can be
+// asked for ahead of time: this computes the same n-gram rows set_input() will gather and issues an
+// asynchronous MADV_WILLNEED for their pages from a background thread. Predecessors before the supplied
+// context read as EOS (the first few rows of a prompt may be missed; the real gather still faults them).
+// Q4X_PLE_PREFETCH=0 disables. A no-op unless the table is host-resident.
+void llama_model_qwen4exp::prefetch_prompt(const llama_token * tokens, int32_t n_tokens, int32_t n_ctx_prev) const {
+#ifdef __linux__
+    static const bool enabled = [] {
+        const char * e = getenv("Q4X_PLE_PREFETCH");
+        return !(e && e[0] == '0');
+    }();
+    const ggml_tensor * t = per_layer_tok_embd;
+    if (!enabled || !t || !t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) || !tokens) {
+        return;
+    }
+    if (n_ctx_prev < 0 || n_tokens <= n_ctx_prev) {
+        return;
+    }
+
+    const auto & hp = hparams;
+    const int64_t n_gram   = hp.ple_ngram_size;
+    const int64_t per_gram = hp.ple_heads_per_ngram;
+    const int64_t eos      = hp.ple_eos_token_id;
+
+    const int64_t t_start = ggml_time_us();
+
+    std::vector<int32_t> idx;
+    idx.reserve((size_t) (n_tokens - n_ctx_prev) * hp.ple_n_heads);
+
+    for (int64_t i = n_ctx_prev; i < n_tokens; ++i) {
+        // same window and EOS-cut rules as llm_graph_input_ple::set_input()
+        int64_t ctx[LLAMA_MAX_PLE_NGRAM];
+        ctx[0] = tokens[i];
+        bool cut = false;
+        for (int64_t s = 1; s < n_gram; ++s) {
+            const int64_t     k = i - s;
+            const llama_token p = (cut || k < 0) ? LLAMA_TOKEN_NULL : tokens[k];
+            cut = cut || p < 0 || p == eos;
+            ctx[s] = cut ? eos : p;
+        }
+        for (int64_t n = 2; n <= n_gram; ++n) {
+            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+            for (int64_t j = 1; j < n; ++j) {
+                mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
+            }
+            const int64_t base = (n - 2) * per_gram;
+            for (int64_t g = 0; g < per_gram; ++g) {
+                const int64_t h_i = base + g;
+                idx.push_back((int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]));
+            }
+        }
+    }
+
+    // rows -> page-aligned byte ranges of the mapping, coalesced
+    const size_t    pg        = (size_t) sysconf(_SC_PAGESIZE);
+    const size_t    row_bytes = ggml_row_size(t->type, t->ne[0]);
+    const uintptr_t base      = (uintptr_t) t->data;
+
+    std::vector<uintptr_t> pages;
+    pages.reserve(idx.size() * 2);
+    for (const int32_t r : idx) {
+        const uintptr_t a  = base + (uintptr_t) r * (uintptr_t) t->nb[1];
+        const uintptr_t p0 = a & ~(uintptr_t) (pg - 1);
+        const uintptr_t p1 = (a + row_bytes - 1) & ~(uintptr_t) (pg - 1);
+        for (uintptr_t p = p0; p <= p1; p += pg) {
+            pages.push_back(p);
+        }
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+
+    std::vector<std::pair<uintptr_t, size_t>> ranges;
+    for (const uintptr_t p : pages) {
+        if (!ranges.empty() && ranges.back().first + ranges.back().second == p) {
+            ranges.back().second += pg;
+        } else {
+            ranges.emplace_back(p, pg);
+        }
+    }
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        fprintf(stderr, "qwen4exp: ple prefetch engaged (first: %d tokens -> %zu rows, %zu pages in %zu ranges, %.1f ms to compute)\n",
+                (int) (n_tokens - n_ctx_prev), idx.size(), pages.size(), ranges.size(), (ggml_time_us() - t_start) / 1000.0);
+    }
+
+    // the hint is issued off the calling thread: the caller is about to submit GPU work and must not
+    // wait on 10^4 madvise calls. The mapping outlives every request (model lifetime).
+    std::thread([ranges = std::move(ranges)]() {
+        for (const auto & r : ranges) {
+            madvise((void *) r.first, r.second, MADV_WILLNEED);
+        }
+    }).detach();
+#else
+    GGML_UNUSED(tokens); GGML_UNUSED(n_tokens); GGML_UNUSED(n_ctx_prev);
+#endif
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.

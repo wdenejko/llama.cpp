@@ -2339,6 +2339,8 @@ struct llama_model_qwen35 : public llama_model_base {
 
 
 struct llama_model_qwen4exp : public llama_model_base {
+    // [Q4X_PLE_PREFETCH] see llama_model::prefetch_prompt: per-layer-token-embedding rows of the next ubatch
+    void prefetch_prompt(const llama_token * tokens, int32_t n_tokens, int32_t n_ctx_prev) const override;
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
     class llm_graph_input_qsa;

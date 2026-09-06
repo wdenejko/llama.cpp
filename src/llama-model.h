@@ -763,6 +763,14 @@ struct llama_model {
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
+
+    // [Q4X_PLE_PREFETCH] hint that tokens[n_ctx_prev..n_tokens) are about to be decoded, with the
+    // n_ctx_prev preceding tokens supplied for context. A model whose input embedding table is
+    // mapping-resident (TENSOR_READ_LAZY) can start reading the rows it will gather while the
+    // current ubatch computes; a no-op elsewhere. Purely a performance hint, never affects results.
+    virtual void prefetch_prompt(const llama_token * tokens, int32_t n_tokens, int32_t n_ctx_prev) const {
+        GGML_UNUSED(tokens); GGML_UNUSED(n_tokens); GGML_UNUSED(n_ctx_prev);
+    }
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
 protected:
