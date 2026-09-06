@@ -12065,6 +12065,32 @@ static bool ggml_vk_fa_kv_native(ggml_type t, bool coopmat2) {
 // the free-VRAM level where paging starts. The reserve is necessarily conservative because other
 // processes' VRAM use is invisible to us. GGML_VK_FA_DEQUANT=0/1 forces the path off/on;
 // GGML_VK_FA_DEQUANT_RESERVE_MB overrides the reserve.
+// The dequant/contiguize shaders (dequant_*_transpose, dequant_f16_transpose) read the source as a
+// FLAT run of nel elements from the tensor's offset and remap it assuming the physical order is
+// [HS][NH][KV][NS] -- heads packed immediately inside the KV stride. ggml_is_contiguously_allocated()
+// cannot stand in for that check: it compares a byte span against nelements*type_size, and a span
+// is permutation-INVARIANT, so every dense permutation passes it. Two dense-but-wrongly-ordered K/V
+// reach FA in practice (a heads-outer [HS][KV][NH] tensor, and MiniMax-M3's MSA batch view whose
+// stream dim is physically inner); both were admitted by the old check and silently remapped from
+// the wrong rows. Pin the order explicitly instead. A condition on a dimension is vacuous when its
+// ne == 1 (the shader never uses that stride), which keeps the ordinary KV-cache view (ne[3] == 1)
+// and the ne[2] == 1 MQA/MSA shapes eligible. Density is implied by these conditions, so no
+// separate contiguity check is needed. (Nathan Wilson, b6e4ac7794; ported without the A/B env knob)
+static bool ggml_vk_fa_dequant_src_order(const ggml_tensor * t) {
+    if (t->ne[0] % ggml_blck_size(t->type) != 0) {
+        // a quant block would straddle the HS boundary; the ib*32 -> b_idx remap assumes it does not
+        return false;
+    }
+    const uint64_t rs = (uint64_t) ggml_row_size(t->type, t->ne[0]);
+    return t->nb[0] == ggml_type_size(t->type) &&
+           // heads packed immediately inside the KV stride
+           (t->ne[2] == 1 || (uint64_t) t->nb[2] == rs) &&
+           // one KV step spans the whole head block
+           (t->ne[1] == 1 || (uint64_t) t->nb[1] == rs * t->ne[2]) &&
+           // one stream step spans the whole [HS, NH, KV] block
+           (t->ne[3] == 1 || (uint64_t) t->nb[3] == rs * t->ne[2] * t->ne[1]);
+}
+
 static bool ggml_vk_fa_dequant_scratch_fits(ggml_backend_vk_context * ctx, uint64_t scratch_sz) {
     const vk_device& device = ctx->device;
 
@@ -12147,8 +12173,7 @@ static bool ggml_vk_flash_attn_top_k(ggml_backend_vk_context * ctx, vk_context &
     const bool dequant_kv = top_k && k->type != GGML_TYPE_F16 &&
                             !(fa_dequant_env && fa_dequant_env[0] == '0') &&
                             ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
-                            k->nb[0] == ggml_type_size(k->type) &&
-                            ggml_is_contiguously_allocated(k) &&
+                            ggml_vk_fa_dequant_src_order(k) &&
                             kv_f16_sz <= ctx->device->properties.limits.maxStorageBufferRange &&
                             ggml_vk_fa_dequant_scratch_fits(ctx, kv_f16_sz);
     if ((top_k_env && top_k_env[0] == '0') ||
@@ -12939,8 +12964,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                 // dequant/contiguize pass must not run on top of it
                                 !fa_compact.active &&
                                 ((k_quant && v_quant) || kv_needs_dequant || (fa_kv_contig && kv_f16_strided)) && neq1 >= 64 &&
-                                k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
-                                ggml_is_contiguously_allocated(k) && ggml_is_contiguously_allocated(v) &&
+                                ggml_vk_fa_dequant_src_order(k) && ggml_vk_fa_dequant_src_order(v) &&
                                 kv_f16_sz <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
                                 ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
@@ -21509,8 +21533,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         op->src[0]->ne[1] < 64 ||
                         device->pipeline_dequant_transpose[k->type] == nullptr ||
                         device->pipeline_dequant_transpose[v->type] == nullptr ||
-                        k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type) ||
-                        !ggml_is_contiguously_allocated(k) || !ggml_is_contiguously_allocated(v) ||
+                        !ggml_vk_fa_dequant_src_order(k) || !ggml_vk_fa_dequant_src_order(v) ||
                         kv_f16_sz > device->properties.limits.maxStorageBufferRange) {
                         return false;
                     }

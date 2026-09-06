@@ -10416,6 +10416,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // FA dequant-once source-order exposure (Nathan Wilson, b6e4ac7794): the dequant_*_transpose
+    // shaders assume a heads-INNER source ([HS][NH][KV][NS]); a dense heads-OUTER K/V (permute
+    // {0,1,2,3} + kv_view=false) used to pass the span-based gate and was mis-transposed.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0,   GGML_TYPE_Q4_0,   {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(64,  64,  4, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL, {0, 1, 2, 3}, false));
+    // controls: (a) heads-inner engages and is correct, (b) nh==1 makes the order irrelevant,
+    // (c) nb=2 stays below the prefill gate, (d) dense heads-outer f16 self-excludes from contiguize
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512,  2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0,   GGML_TYPE_Q8_0,   {0, 1, 2, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,    GGML_TYPE_F16,    {0, 1, 2, 3}, false));
+    // MiniMax-M3 MSA batch geometry (kfa = ggml_permute(k_s, 0, 3, 1, 2)): the STREAM dim is physically
+    // inner, where the shader expects heads; dense, so the old gate admitted it. (e) single stream is legal.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 8}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 3, 2, 1}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 8}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  {0, 3, 2, 1}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {1, 1}, 512, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 3, 2, 1}, false));
+
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
