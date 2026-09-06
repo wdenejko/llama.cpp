@@ -3776,6 +3776,28 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // [Q4X_PLE_PREFETCH] hint the input-embedding rows of the NEXT view (and of the first one) so a
+        // mapping-resident table is read while this view computes on the GPU; a no-op for other models
+        if (!batch.has_embd) {
+            const auto hint = [&](int32_t start, int32_t n) {
+                if (n <= 0) {
+                    return;
+                }
+                const int32_t n_ctxp = std::min<int32_t>(start, 8);
+                std::vector<llama_token> ids;
+                ids.reserve(n + n_ctxp);
+                for (int32_t k = start - n_ctxp; k < start + n; ++k) {
+                    ids.push_back(batch.tokens[k].token);
+                }
+                llama_prefetch_prompt(ctx_tgt, ids.data(), (int32_t) ids.size(), n_ctxp);
+            };
+            if (off == 0) {
+                hint(0, batch_view.n_tokens);
+            }
+            const int32_t next = off + batch_view.n_tokens;
+            hint(next, std::min<int32_t>(n_batch, batch.size() - next));
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;

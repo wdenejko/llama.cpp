@@ -1010,6 +1010,11 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // Performance hint: tokens[n_ctx_prev..n_tokens) are about to be decoded (the first n_ctx_prev
+    // entries are the preceding tokens, for context). A model with a mapping-resident input embedding
+    // table starts reading the rows it will gather; a no-op for other models. Never affects results.
+    LLAMA_API void llama_prefetch_prompt(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_ctx_prev);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //

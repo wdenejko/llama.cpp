@@ -3850,6 +3850,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }
 
+void llama_prefetch_prompt(llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_ctx_prev) {
+    ctx->get_model().prefetch_prompt(tokens, n_tokens, n_ctx_prev);
+}
+
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
